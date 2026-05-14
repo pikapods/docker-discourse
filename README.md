@@ -160,7 +160,7 @@ Rebuild with a custom UID/GID if the defaults clash:
 docker build \
   --build-arg DISCOURSE_UID=$(id -u) \
   --build-arg DISCOURSE_GID=$(id -g) \
-  -t container-discourse:local .
+  -t docker-discourse:local .
 ```
 
 ## Healthcheck

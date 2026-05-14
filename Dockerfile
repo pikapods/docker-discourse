@@ -5,7 +5,7 @@
 # Build:
 #   docker build \
 #     --build-arg DISCOURSE_VERSION=v2026.4.0 \
-#     -t ghcr.io/pikapods/container-discourse:v2026.4.0 .
+#     -t ghcr.io/pikapods/docker-discourse:v2026.4.0 .
 
 ARG RUBY_VERSION=3.4
 ARG NODE_VERSION=24
@@ -120,7 +120,7 @@ ARG DISCOURSE_VERSION
 
 LABEL org.opencontainers.image.title="Discourse" \
       org.opencontainers.image.description="Standalone, 12-factor Discourse container" \
-      org.opencontainers.image.source="https://github.com/pikapods/container-discourse" \
+      org.opencontainers.image.source="https://github.com/pikapods/docker-discourse" \
       org.opencontainers.image.licenses="GPL-2.0" \
       org.opencontainers.image.version="${DISCOURSE_VERSION}"
 

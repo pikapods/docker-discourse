@@ -13,14 +13,14 @@ on:
         default: "3.4"
         type: string
       publish:
-        description: "Publish to GHCR after tests pass"
+        description: "Publish to GHCR and Docker Hub after tests pass"
         required: false
         default: true
         type: boolean
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+  DOCKERHUB_IMAGE: docker.io/pikapods/docker-discourse
 
 jobs:
   build:
@@ -63,11 +63,11 @@ jobs:
           build-args: |
             DISCOURSE_VERSION=${{ steps.vars.outputs.discourse_version }}
             RUBY_VERSION=${{ steps.vars.outputs.ruby_version }}
-          tags: container-discourse:test
+          tags: docker-discourse:test
           provenance: false
 
       - name: Save image tarball
-        run: docker save container-discourse:test -o /tmp/image.tar
+        run: docker save docker-discourse:test -o /tmp/image.tar
 
       - name: Upload image artifact
         uses: actions/upload-artifact@v7
@@ -102,12 +102,12 @@ jobs:
 
       - name: Fast image tests
         env:
-          IMAGE: container-discourse:test
+          IMAGE: docker-discourse:test
         run: pytest -v tests/ -m "not runtime" --junitxml=report-image.xml
 
       - name: Runtime tests (boots real pg + redis)
         env:
-          IMAGE: container-discourse:test
+          IMAGE: docker-discourse:test
         run: pytest -v tests/test_runtime.py -m runtime --junitxml=report-runtime.xml
 
       - name: Dump discourse container logs on failure
@@ -149,7 +149,7 @@ jobs:
 
       - name: Bring up compose stack
         env:
-          DISCOURSE_IMAGE: container-discourse:test
+          DISCOURSE_IMAGE: docker-discourse:test
           DISCOURSE_SECRET_KEY_BASE: ${{ steps.secret.outputs.key }}
         run: |
           # Override the placeholder secret + add the prometheus plugin to
@@ -213,9 +213,16 @@ jobs:
       - name: Log in to GHCR
         uses: docker/login-action@v4
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # Re-build for multi-arch + push. The test job validated linux/amd64
       # only; arm64 ships behind that gate. We can't reuse the tarball
@@ -230,6 +237,8 @@ jobs:
             DISCOURSE_VERSION=${{ needs.build.outputs.discourse_version }}
             RUBY_VERSION=${{ needs.build.outputs.ruby_version }}
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.discourse_version }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+            ${{ env.GHCR_IMAGE }}:${{ needs.build.outputs.discourse_version }}
+            ${{ env.GHCR_IMAGE }}:${{ needs.build.outputs.image_tag }}
+            ${{ env.DOCKERHUB_IMAGE }}:${{ needs.build.outputs.discourse_version }}
+            ${{ env.DOCKERHUB_IMAGE }}:${{ needs.build.outputs.image_tag }}
           provenance: false

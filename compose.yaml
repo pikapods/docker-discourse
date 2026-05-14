@@ -30,7 +30,7 @@ services:
     restart: unless-stopped
 
   discourse:
-    image: ${DISCOURSE_IMAGE:-ghcr.io/pikapods/container-discourse:latest}
+    image: ${DISCOURSE_IMAGE:-ghcr.io/pikapods/docker-discourse:latest}
     depends_on:
       postgres:
         condition: service_healthy
