@@ -1,0 +1,12 @@
+#!/command/with-contenv sh
+# discourse-sidekiq — background job runner. Discourse is broken without it
+# (digest mail, search index, notifications, image processing). Gated by
+# CONTAINER_DISCOURSE_ENABLE_SIDEKIQ for the rare "I run sidekiq in a sidecar"
+# deployment; the longrun stays as a placeholder so s6 doesn't restart it.
+
+[ "${CONTAINER_DISCOURSE_ENABLE_SIDEKIQ:-TRUE}" = "TRUE" ] || exec sleep infinity
+
+cd /app || exit 1
+exec gosu discourse:discourse bundle exec sidekiq \
+    --concurrency "${CONTAINER_DISCOURSE_SIDEKIQ_CONCURRENCY:-5}" \
+    -q critical,4 -q default,2 -q low -q ultra_low

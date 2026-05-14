@@ -1,0 +1,15 @@
+#!/command/with-contenv sh
+# discourse-web — Pitchfork app server on :3000.
+#
+# config/pitchfork.conf.rb is upstream's; it reads UNICORN_WORKERS for
+# backwards-compatibility (Pitchfork inherits Unicorn's config schema).
+# We map the image-owned CONTAINER_DISCOURSE_PITCHFORK_WORKERS onto that
+# so operators don't have to know about the legacy name.
+
+cd /app || exit 1
+export UNICORN_WORKERS="${CONTAINER_DISCOURSE_PITCHFORK_WORKERS:-3}"
+# Bind to 0.0.0.0 so the host-published port reaches us. Without this,
+# upstream's pitchfork.conf.rb listens on 127.0.0.1 (loopback inside the
+# container namespace), which the host's port mapping can't traverse.
+export UNICORN_BIND_ALL=1
+exec gosu discourse:discourse bundle exec pitchfork -c config/pitchfork.conf.rb -E production

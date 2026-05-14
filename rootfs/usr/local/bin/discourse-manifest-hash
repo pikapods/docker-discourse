@@ -1,0 +1,74 @@
+#!/bin/sh
+# discourse-manifest-hash — single source of truth for the plugin manifest hash.
+#
+# Computes a sha256 over: sorted built-in plugin names + sorted
+# "<third-party-name>\t<git HEAD sha>" pairs. Used at build time to bake
+# /app/baked-plugin-manifest, and at runtime by the bootstrap script to
+# decide whether the bundle install + asset precompile needs to rerun.
+#
+# Both call sites MUST invoke this helper to avoid drift — any change to
+# the hashing rules belongs here, nowhere else.
+set -eu
+
+usage() {
+    cat >&2 <<EOF
+Usage: discourse-manifest-hash --builtin-file <path> --third-party-dir <path|"">
+
+  --builtin-file PATH    File with one bundled-plugin name per line. Names
+                         are sorted and folded into the hash. Pass an empty
+                         file (or one with only blanks) to represent
+                         "no built-in plugins active".
+  --third-party-dir PATH Directory containing cloned third-party plugin
+                         repos (one subdir per plugin). For each subdir,
+                         "<name>\\t<git rev-parse HEAD>" is appended to the
+                         hash input. Pass "" to represent "no third-party".
+EOF
+}
+
+builtin_file=
+third_party_dir=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --builtin-file) builtin_file=$2; shift 2 ;;
+        --third-party-dir) third_party_dir=$2; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage; exit 2 ;;
+    esac
+done
+
+[ -n "$builtin_file" ] || { usage; exit 2; }
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+
+# Built-ins: blank lines and leading/trailing whitespace stripped, then sort -u.
+if [ -f "$builtin_file" ]; then
+    awk '{ gsub(/[[:space:]]/,""); if (length) print }' "$builtin_file" \
+        | LC_ALL=C sort -u >> "$tmp"
+fi
+
+# Separator between the two sections so an empty builtin section and an
+# empty third-party section don't collide with non-empty inputs.
+printf -- '---third-party---\n' >> "$tmp"
+
+if [ -n "$third_party_dir" ] && [ -d "$third_party_dir" ]; then
+    # For each subdir, capture name + HEAD sha. Skip non-git dirs silently
+    # (they shouldn't exist but we don't want a bad clone to spook the hash).
+    # -c safe.directory='*' suppresses the "dubious ownership" check —
+    # bootstrap runs this helper as root over /data/plugins/* owned by the
+    # discourse user; without the override git refuses and the plugin is
+    # silently skipped, leaving the manifest hash unchanged.
+    for d in "$third_party_dir"/*/; do
+        [ -d "$d" ] || continue
+        name=$(basename "$d")
+        if sha=$(git -c safe.directory='*' -C "$d" rev-parse HEAD 2>/dev/null); then
+            printf '%s\t%s\n' "$name" "$sha"
+        fi
+    done | LC_ALL=C sort >> "$tmp"
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$tmp" | awk '{print $1}'
+else
+    openssl dgst -sha256 "$tmp" | awk '{print $NF}'
+fi

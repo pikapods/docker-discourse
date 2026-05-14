@@ -1,0 +1,80 @@
+name: discourse
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: discourse
+      POSTGRES_USER: discourse
+      POSTGRES_PASSWORD: changeme   # change before any real deployment
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U discourse -d discourse"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  discourse:
+    image: ${DISCOURSE_IMAGE:-ghcr.io/pikapods/container-discourse:latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Required.
+      DISCOURSE_HOSTNAME: localhost
+      DISCOURSE_PORT: 3000
+      DISCOURSE_DB_HOST: postgres
+      DISCOURSE_DB_USERNAME: discourse
+      DISCOURSE_DB_PASSWORD: changeme
+      DISCOURSE_DB_NAME: discourse
+      DISCOURSE_REDIS_HOST: redis
+      DISCOURSE_SMTP_ADDRESS: host.containers.internal
+      DISCOURSE_SMTP_PORT: 1025
+      DISCOURSE_SMTP_ENABLE_START_TLS: "false"
+      DISCOURSE_SMTP_OPENSSL_VERIFY_MODE: none
+      DISCOURSE_DEVELOPER_EMAILS: admin@example.com
+      # Generate once with `openssl rand -hex 64` and keep stable across recreates.
+      # Rotating this value invalidates sessions and corrupts encrypted columns.
+      DISCOURSE_SECRET_KEY_BASE: ${DISCOURSE_SECRET_KEY_BASE:?DISCOURSE_SECRET_KEY_BASE must be set (openssl rand -hex 64)}
+
+      # First-boot admin (idempotent — skipped if any admin already exists).
+      CONTAINER_DISCOURSE_ADMIN_EMAIL: admin@example.com
+      CONTAINER_DISCOURSE_ADMIN_PASSWORD: changeme
+      CONTAINER_DISCOURSE_ADMIN_USERNAME: admin
+
+      # Optional: third-party plugins. Each entry: <git_url>[@<ref>][#<name>].
+      # Uncomment to demo the runtime-install path.
+      CONTAINER_DISCOURSE_PLUGINS: >-
+        https://github.com/discourse/discourse-prometheus@main,
+        https://github.com/discourse/discourse-bbcode@main
+
+      # Optional: control which bundled plugins are active.
+      # Unset → default-7. "" → none. "*" → all. "checklist,poll" → subset.
+      # CONTAINER_DISCOURSE_PLUGINS_BUILTIN: "*"
+    volumes:
+      - discourse-data:/data
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  discourse-data:

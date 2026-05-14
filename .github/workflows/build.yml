@@ -1,0 +1,235 @@
+name: Build and publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      discourse_version:
+        description: "Discourse git ref (e.g. v2026.4.0 or 'release')"
+        required: true
+        type: string
+      ruby_version:
+        description: "Ruby minor version"
+        required: false
+        default: "3.4"
+        type: string
+      publish:
+        description: "Publish to GHCR after tests pass"
+        required: false
+        default: true
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      discourse_version: ${{ steps.vars.outputs.discourse_version }}
+      ruby_version: ${{ steps.vars.outputs.ruby_version }}
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve and validate build args
+        id: vars
+        run: |
+          DC_VER="${{ inputs.discourse_version }}"
+          RB_VER="${{ inputs.ruby_version }}"
+          # Accept dated calver tags (v2026.4.0, v2026.4.0-beta1), the
+          # rolling upstream aliases, or a 40-char SHA.
+          if ! echo "$DC_VER" | grep -Eq '^v[0-9]{4}\.[0-9]+\.[0-9]+(-.*)?$|^(release|stable|beta|tests-passed)$|^[0-9a-f]{40}$'; then
+            echo "::error::discourse_version '$DC_VER' does not match an accepted format"
+            exit 1
+          fi
+          echo "discourse_version=$DC_VER" >>"$GITHUB_OUTPUT"
+          echo "ruby_version=$RB_VER"      >>"$GITHUB_OUTPUT"
+          echo "image_tag=${DC_VER}-ruby${RB_VER}" >>"$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image (local load)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          # Tests run against linux/amd64; multi-arch push is deferred to
+          # the publish job to avoid double-building during PR validation.
+          platforms: linux/amd64
+          build-args: |
+            DISCOURSE_VERSION=${{ steps.vars.outputs.discourse_version }}
+            RUBY_VERSION=${{ steps.vars.outputs.ruby_version }}
+          tags: container-discourse:test
+          provenance: false
+
+      - name: Save image tarball
+        run: docker save container-discourse:test -o /tmp/image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: image
+          path: /tmp
+
+      - name: Load image
+        run: docker load -i /tmp/image.tar
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install test deps
+        run: pip install -r tests/requirements.txt
+
+      - name: Fast image tests
+        env:
+          IMAGE: container-discourse:test
+        run: pytest -v tests/ -m "not runtime" --junitxml=report-image.xml
+
+      - name: Runtime tests (boots real pg + redis)
+        env:
+          IMAGE: container-discourse:test
+        run: pytest -v tests/test_runtime.py -m runtime --junitxml=report-runtime.xml
+
+      - name: Dump discourse container logs on failure
+        if: failure()
+        run: |
+          for c in $(docker ps -a --filter "name=^dc-app-" --format '{{.Names}}'); do
+            echo "--- $c ---"
+            docker logs "$c" 2>&1 || true
+          done
+
+      - name: Upload pytest reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pytest-reports
+          path: report-*.xml
+          retention-days: 7
+
+  compose-test:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: image
+          path: /tmp
+
+      - name: Load image
+        run: docker load -i /tmp/image.tar
+
+      - name: Generate secret_key_base
+        id: secret
+        run: echo "key=$(openssl rand -hex 64)" >>"$GITHUB_OUTPUT"
+
+      - name: Bring up compose stack
+        env:
+          DISCOURSE_IMAGE: container-discourse:test
+          DISCOURSE_SECRET_KEY_BASE: ${{ steps.secret.outputs.key }}
+        run: |
+          # Override the placeholder secret + add the prometheus plugin to
+          # exercise the runtime install path on a real compose flow.
+          export DISCOURSE_SECRET_KEY_BASE
+          docker compose up -d
+
+      - name: Wait for /srv/status to return 200
+        run: |
+          for i in $(seq 1 120); do
+            code=$(curl -sf -o /dev/null -w '%{http_code}' http://localhost:3000/srv/status || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "ready after ${i} polls"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "timed out waiting for /srv/status"
+          exit 1
+
+      - name: Assert healthcheck propagated
+        run: |
+          for i in $(seq 1 24); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' discourse-discourse-1)
+            echo "health status: $status"
+            [ "$status" = "healthy" ] && exit 0
+            [ "$status" = "unhealthy" ] && exit 1
+            sleep 5
+          done
+          exit 1
+
+      - name: Assert clean first boot
+        run: |
+          restarts=$(docker inspect --format '{{.RestartCount}}' discourse-discourse-1)
+          [ "$restarts" = "0" ] || exit 1
+          if docker compose logs discourse 2>&1 | grep -E 'not reachable|FATAL|Restarting'; then
+            exit 1
+          fi
+
+      - name: Dump compose logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  publish:
+    needs: [build, test, compose-test]
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Re-build for multi-arch + push. The test job validated linux/amd64
+      # only; arm64 ships behind that gate. We can't reuse the tarball
+      # because it's single-arch.
+      - name: Build and push (multi-arch)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            DISCOURSE_VERSION=${{ needs.build.outputs.discourse_version }}
+            RUBY_VERSION=${{ needs.build.outputs.ruby_version }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.discourse_version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+          provenance: false
