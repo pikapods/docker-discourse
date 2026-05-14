@@ -63,9 +63,10 @@ class TestImageMetadata:
 
     def test_image_size_under_limit(self, inspect):
         size_mb = inspect["Size"] / (1024 * 1024)
-        # 2 GB is the documented ceiling — we retain the build toolchain
-        # for runtime plugin install, which costs ~700 MB over a slim base.
-        assert size_mb < 2048, f"image size {size_mb:.0f} MB exceeds 2 GB guardrail"
+        # Retained build toolchain for runtime plugin install plus the full
+        # bundled-plugin stash at /opt/discourse-plugins-core (50+ trees) put
+        # the floor near 2.8 GB; 3.5 GB is the regression alarm.
+        assert size_mb < 3584, f"image size {size_mb:.0f} MB exceeds 3.5 GB guardrail"
 
     def test_default_env_present(self, inspect):
         env = dict(e.split("=", 1) for e in inspect["Config"].get("Env") or [])

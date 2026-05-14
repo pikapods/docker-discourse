@@ -144,22 +144,20 @@ jobs:
         run: docker load -i /tmp/image.tar
 
       - name: Generate secret_key_base
-        id: secret
-        run: echo "key=$(openssl rand -hex 64)" >>"$GITHUB_OUTPUT"
+        # Export to GITHUB_ENV so every later step (compose up, log dump,
+        # tear down) sees it — compose.yaml uses ${VAR:?...} validation.
+        run: echo "DISCOURSE_SECRET_KEY_BASE=$(openssl rand -hex 64)" >>"$GITHUB_ENV"
 
       - name: Bring up compose stack
         env:
           DISCOURSE_IMAGE: docker-discourse:test
-          DISCOURSE_SECRET_KEY_BASE: ${{ steps.secret.outputs.key }}
-        run: |
-          # Override the placeholder secret + add the prometheus plugin to
-          # exercise the runtime install path on a real compose flow.
-          export DISCOURSE_SECRET_KEY_BASE
-          docker compose up -d
+        run: docker compose up -d
 
       - name: Wait for /srv/status to return 200
+        # 10 min ceiling: first boot runs db:migrate against an empty DB
+        # plus pitchfork warm-up; healthcheck start_period is already 180s.
         run: |
-          for i in $(seq 1 120); do
+          for i in $(seq 1 300); do
             code=$(curl -sf -o /dev/null -w '%{http_code}' http://localhost:3000/srv/status || echo "000")
             if [ "$code" = "200" ]; then
               echo "ready after ${i} polls"
@@ -168,6 +166,8 @@ jobs:
             sleep 2
           done
           echo "timed out waiting for /srv/status"
+          docker compose ps
+          docker compose logs --tail=200 discourse
           exit 1
 
       - name: Assert healthcheck propagated
