@@ -99,7 +99,7 @@ RUN while read p; do \
 RUN SKIP_DB_AND_REDIS=1 \
     DISCOURSE_SECRET_KEY_BASE=$(openssl rand -hex 64) \
         bundle exec rake assets:precompile \
- && rm -rf /app/.github
+ && rm -rf /app/.github /app/spec /app/test /app/docs /app/tmp
 
 # Copy the shared hash helper now so we can bake a manifest matching what
 # bootstrap will compute at runtime. Identical script → identical hash →
