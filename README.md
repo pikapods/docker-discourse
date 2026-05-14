@@ -1,5 +1,9 @@
 # docker-discourse
 
+This image is maintained by [PikaPods](https://www.pikapods.com/), where Discourse
+is also available as a managed app from **$5.3/month** — no setup, automatic
+updates, your own backups.
+
 A standalone, OCI-friendly Docker image for [Discourse](https://github.com/discourse/discourse).
 
 Unlike upstream's `discourse_docker` (a bash launcher that owns the
@@ -7,6 +11,20 @@ container lifecycle), this image is a plain container: external Postgres,
 Redis, SMTP, and reverse proxy. It uses Discourse's own `DISCOURSE_*` env
 vars unchanged, runs **Pitchfork** on port 3000, and precompiles core
 assets at build time for fast cold boot.
+
+## Prebuilt images
+
+Published to both registries on every release:
+
+```text
+ghcr.io/pikapods/docker-discourse:<tag>
+docker.io/pikapods/docker-discourse:<tag>
+```
+
+Tags follow upstream's calendar versioning (`v2026.4.0`) plus a `latest`
+alias for the most recent build. `compose.yaml` defaults to
+`ghcr.io/pikapods/docker-discourse:latest`; override with the
+`DISCOURSE_IMAGE` env var.
 
 ## Quick start
 
@@ -29,7 +47,7 @@ Browse to `http://localhost:3000`. First-boot admin credentials come from
 
 | Path | Purpose |
 |---|---|
-| `/app` | Discourse source tree (read-only at runtime) |
+| `/app` | Discourse source tree (mostly immutable; `/app/plugins/` is rebuilt at boot, and `public/{uploads,backups,assets}` are symlinks into `/data`) |
 | `/opt/discourse-plugins-core/` | Bundled plugins as shipped by upstream (kept outside Rails root to avoid autoloader double-scanning) |
 | `/app/plugins/` | Active plugin set (symlinks; rebuilt at boot) |
 | `/app/assets-baked/` | Precompiled asset snapshot from build time |
@@ -70,6 +88,7 @@ organisation. Logs go to stdout.
 
 ### Common optional `DISCOURSE_*` (passthrough)
 
+`DISCOURSE_PORT` (Pitchfork listen port; defaults to 3000),
 `DISCOURSE_DB_PORT`, `DISCOURSE_DB_POOL`,
 `DISCOURSE_REDIS_PORT`, `DISCOURSE_REDIS_PASSWORD`, `DISCOURSE_REDIS_USE_SSL`,
 `DISCOURSE_SMTP_PORT`, `DISCOURSE_SMTP_USER_NAME` (note the underscore — canonical upstream spelling),
@@ -99,14 +118,16 @@ they pass through unchanged.
 ## Plugins
 
 Plugins are full Rails sub-projects: adding one means re-running
-`bundle install` (it may declare gems), `assets:precompile`, and a
-migration. This image accepts the cost honestly: the first boot after a
-plugin change runs all three, and the manifest hash is stored in
-`/data/cache/.plugin-manifest` so subsequent boots skip the rebuild.
+`bundle install` (it may declare gems), `themes:update`, and
+`assets:precompile`. This image accepts the cost honestly: the first
+boot after a plugin change runs all three, and the manifest hash is
+stored in `/data/cache/.plugin-manifest` so subsequent boots skip the
+rebuild. (`db:migrate` runs every boot regardless, gated by
+`CONTAINER_DISCOURSE_DB_MIGRATE`.)
 
 ### Bundled vs third-party
 
-Discourse ships ~43 plugins under [`plugins/` in the source tree](https://github.com/discourse/discourse/tree/main/plugins)
+Discourse ships 50+ plugins under [`plugins/` in the source tree](https://github.com/discourse/discourse/tree/main/plugins)
 ("bundled") — `chat`, `discourse-ai`, `discourse-narrative-bot`, ... These
 are all baked into the image at `/opt/discourse-plugins-core/`. Use
 `CONTAINER_DISCOURSE_PLUGINS_BUILTIN` to choose which ones are active:
