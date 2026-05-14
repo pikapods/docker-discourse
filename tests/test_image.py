@@ -11,7 +11,6 @@ DEFAULT_PLUGINS = [
     "checklist",
     "discourse-details",
     "discourse-narrative-bot",
-    "poll",
     "discourse-presence",
     "discourse-reactions",
     "styleguide",
@@ -132,16 +131,16 @@ class TestImageFilesystem:
         assert r.stdout.strip() == "0", f"/app/plugins not empty: {r.stdout!r}"
 
     def test_plugins_core_dir_populated(self):
-        r = _run("sh", "-c", "ls -A /app/plugins-core | wc -l")
+        r = _run("sh", "-c", "ls -A /opt/discourse-plugins-core | wc -l")
         assert r.returncode == 0, r.stderr
         # Conservative floor; current main ships ~43. Plan promises ≥20.
         count = int(r.stdout.strip())
-        assert count >= 20, f"/app/plugins-core has only {count} entries"
+        assert count >= 20, f"/opt/discourse-plugins-core has only {count} entries"
 
     def test_narrative_bot_present_in_core(self):
         # Spot-check that bundled plugins moved cleanly: plugin.rb is the
         # canonical entry file for every Discourse plugin.
-        r = _run("test", "-f", "/app/plugins-core/discourse-narrative-bot/plugin.rb")
+        r = _run("test", "-f", "/opt/discourse-plugins-core/discourse-narrative-bot/plugin.rb")
         assert r.returncode == 0, "discourse-narrative-bot/plugin.rb missing"
 
     def test_baked_default_plugins_contents(self):
@@ -162,7 +161,7 @@ class TestImageFilesystem:
         r = _run(
             "sh", "-c",
             "/usr/local/bin/discourse-manifest-hash "
-            "--builtin-file /app/baked-default-plugins --third-party-dir '' "
+            "--builtin-file /app/baked-default-plugins --third-party-file /dev/null "
             "&& cat /app/baked-plugin-manifest"
         )
         assert r.returncode == 0, r.stderr

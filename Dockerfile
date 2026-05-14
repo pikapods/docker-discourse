@@ -58,13 +58,17 @@ RUN bundle config set --local path /usr/local/bundle \
 
 RUN pnpm install --frozen-lockfile
 
-# Move ALL bundled plugins out of /app/plugins → /app/plugins-core, then
-# symlink only the default-6 back in. assets:precompile then bakes assets
-# matching the runtime default surface, so a no-config first boot doesn't
-# need to rebuild.
-RUN mkdir -p /app/plugins-core \
+# Move ALL bundled plugins out of /app/plugins → /opt/discourse-plugins-core,
+# then symlink only the default set back in. The core stash lives OUTSIDE
+# Rails root on purpose: keeping a second copy of every plugin under /app
+# caused Discourse's autoloader to register each constant twice (once via
+# the live symlink path, once via the plugins-core sibling), producing
+# "already initialized constant" warnings at boot. assets:precompile then
+# bakes assets matching the runtime default surface, so a no-config first
+# boot doesn't need to rebuild.
+RUN mkdir -p /opt/discourse-plugins-core \
  && if [ -n "$(ls -A /app/plugins 2>/dev/null)" ]; then \
-        mv /app/plugins/* /app/plugins-core/; \
+        mv /app/plugins/* /opt/discourse-plugins-core/; \
     fi
 
 # Bake the default-active set as a sibling file. Single source of truth for
@@ -80,7 +84,7 @@ RUN printf '%s\n' \
       > /app/baked-default-plugins
 
 RUN while read p; do \
-        [ -d "/app/plugins-core/$p" ] && ln -s "/app/plugins-core/$p" "/app/plugins/$p"; \
+        [ -d "/opt/discourse-plugins-core/$p" ] && ln -s "/opt/discourse-plugins-core/$p" "/app/plugins/$p"; \
     done < /app/baked-default-plugins
 
 # Build-time precompile against the default-6. SKIP_DB_AND_REDIS skips
@@ -101,10 +105,9 @@ RUN SKIP_DB_AND_REDIS=1 \
 # bootstrap will compute at runtime. Identical script → identical hash →
 # no spurious rebuild on first boot.
 COPY rootfs/usr/local/bin/discourse-manifest-hash /usr/local/bin/discourse-manifest-hash
-RUN chmod +x /usr/local/bin/discourse-manifest-hash \
- && /usr/local/bin/discourse-manifest-hash \
+RUN /usr/local/bin/discourse-manifest-hash \
         --builtin-file /app/baked-default-plugins \
-        --third-party-dir "" \
+        --third-party-file /dev/null \
       > /app/baked-plugin-manifest
 
 # ── Stage 2: runtime ────────────────────────────────────────────────────────
@@ -159,13 +162,17 @@ COPY --from=builder --chown=${DISCOURSE_UID}:${DISCOURSE_GID} /app /app
 # into /data/cache/bundle (the runtime BUNDLE_PATH) on first boot. The
 # baked tree is read-only state; the runtime tree is what gets mutated.
 COPY --from=builder --chown=${DISCOURSE_UID}:${DISCOURSE_GID} /usr/local/bundle /usr/local/bundle-baked
+# Bundled plugin stash lives outside Rails root to avoid autoloader double-
+# scanning (see comment in the builder stage). Bootstrap symlinks the active
+# subset from here into /app/plugins on every boot.
+COPY --from=builder --chown=${DISCOURSE_UID}:${DISCOURSE_GID} /opt/discourse-plugins-core /opt/discourse-plugins-core
 
 WORKDIR /app
 
 # /data layout + symlink wiring. /app/plugins is empty at this point
 # (the builder moved plugins-core out, then symlinks were torn out before
 # the COPY; see comment below). The bootstrap rebuilds /app/plugins at boot
-# from /app/plugins-core + /data/plugins.
+# from /opt/discourse-plugins-core + /data/plugins.
 #
 # /app/public/assets is symlinked to /data/cache/assets; the baked content
 # is staged at /app/assets-baked so bootstrap can seed it.
@@ -176,24 +183,16 @@ RUN mkdir -p /data/uploads /data/backups /data/plugins /data/cache/bundle /data/
  && ln -s /data/uploads /app/public/uploads \
  && ln -s /data/backups /app/public/backups \
  && ln -s /data/cache/assets /app/public/assets \
- && chown discourse:discourse /app \
- && chown -R discourse:discourse \
-        /data /app/public /app/plugins /app/plugins-core \
-        /app/assets-baked /app/baked-plugin-manifest /app/baked-default-plugins \
-        /app/.git /app/tmp /app/log /usr/local/bundle-baked
+ && chown -R discourse:discourse /data /app/plugins \
+ && chown -h discourse:discourse /app/public/uploads /app/public/backups /app/public/assets
 
 # Overlay our rootfs (s6 services, bootstrap, hash helper, seed_admin.rb).
+# Scripts in rootfs/ are committed with +x bits so COPY preserves them.
 COPY rootfs/ /
 # COPY rootfs/ / recreates /app and /app/script as root-owned (because
 # rootfs/app/script/ exists). Re-chown them so git's "dubious ownership"
 # check at /app passes when the discourse user runs assemble_ember_build.rb.
-RUN chown discourse:discourse /app /app/script \
- && chown discourse:discourse /app/script/seed_admin.rb \
- && chmod +x /etc/entrypoint.d/20-discourse-bootstrap.sh \
-             /etc/s6-overlay/s6-rc.d/discourse-web/run \
-             /etc/s6-overlay/s6-rc.d/discourse-sidekiq/run \
-             /etc/s6-overlay/s6-rc.d/discourse-bootstrap/up \
-             /usr/local/bin/discourse-manifest-hash
+RUN chown discourse:discourse /app /app/script /app/script/seed_admin.rb
 
 ENV RAILS_ENV=production \
     NODE_ENV=production \

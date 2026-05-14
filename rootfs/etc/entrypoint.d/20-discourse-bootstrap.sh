@@ -13,7 +13,7 @@ BAKED_BUNDLE=/usr/local/bundle-baked
 BAKED_ASSETS=/app/assets-baked
 BAKED_MANIFEST=/app/baked-plugin-manifest
 BAKED_DEFAULT_PLUGINS=/app/baked-default-plugins
-PLUGINS_CORE_DIR=/app/plugins-core
+PLUGINS_CORE_DIR=/opt/discourse-plugins-core
 PLUGINS_LIVE_DIR=/app/plugins
 THIRD_PARTY_DIR=/data/plugins
 MANIFEST_FILE=/data/cache/.plugin-manifest
@@ -92,8 +92,9 @@ done
 # rather than `[ -z "$(ls)" ]` — a stray dotfile shouldn't fool us.
 if [ ! -d "$DATA_DIR/cache/bundle/ruby" ]; then
     log "seeding bundle cache from $BAKED_BUNDLE"
+    # rsync -a preserves the source's discourse:discourse ownership when
+    # run as root, so no follow-up chown is needed.
     rsync -a "$BAKED_BUNDLE/" "$DATA_DIR/cache/bundle/"
-    chown -R "$DISCOURSE_UID:$DISCOURSE_GID" "$DATA_DIR/cache/bundle"
 fi
 
 # Public/assets is a symlink to /data/cache/assets. Empty target = 404s on
@@ -102,7 +103,6 @@ fi
 if [ -z "$(ls -A "$DATA_DIR/cache/assets" 2>/dev/null)" ]; then
     log "seeding asset cache from $BAKED_ASSETS"
     rsync -a "$BAKED_ASSETS/" "$DATA_DIR/cache/assets/"
-    chown -R "$DISCOURSE_UID:$DISCOURSE_GID" "$DATA_DIR/cache/assets"
 fi
 
 # Pre-seed the manifest hash with the baked (default-6) value. When the
@@ -160,7 +160,7 @@ log "redis reachable"
 #      CONTAINER_DISCOURSE_PLUGINS          — third-party manifest.
 # ---------------------------------------------------------------------------
 # Normalise a single name: lowercase, swap underscores for dashes, then
-# match against /app/plugins-core. Accept both "discourse-foo" and "foo"
+# match against $PLUGINS_CORE_DIR. Accept both "discourse-foo" and "foo"
 # spellings — the bundled set is conventionally prefixed but operators
 # routinely drop the prefix.
 normalise_builtin() {
@@ -179,7 +179,11 @@ normalise_builtin() {
 
 # Resolve the built-in allow-list into a tmp file (one canonical name per line).
 BUILTIN_LIST=$(mktemp)
-trap 'rm -f "$BUILTIN_LIST" "${THIRD_PARTY_LIST:-}"' EXIT
+# ACTIVE_TP_FILE holds "<name>\t<HEAD-sha>" lines for the third-party plugins
+# we're actually symlinking into /app/plugins this boot — fed to the manifest
+# hasher so the dropped-but-cached plugin set doesn't poison the hash.
+ACTIVE_TP_FILE=$(mktemp)
+trap 'rm -f "$BUILTIN_LIST" "${THIRD_PARTY_LIST:-}" "$ACTIVE_TP_FILE"' EXIT
 
 # `${VAR+set}` distinguishes "unset" from "empty" — empty is an explicit
 # opt-out, unset is "give me the defaults".
@@ -240,9 +244,7 @@ fi
 
 # Clone / update third-party plugins. Network failures on already-cached
 # plugins are demoted to a WARN so offline boots succeed when the cache is
-# at the right ref.
-mkdir -p "$THIRD_PARTY_DIR"
-chown "$DISCOURSE_UID:$DISCOURSE_GID" "$THIRD_PARTY_DIR"
+# at the right ref. $THIRD_PARTY_DIR was created and chowned in step 3.
 while IFS=$(printf '\t') read -r url ref name; do
     [ -n "$name" ] || continue
     dest="$THIRD_PARTY_DIR/$name"
@@ -292,15 +294,20 @@ while IFS= read -r name; do
     [ -d "$src" ] || { log "WARN: missing bundled plugin source: $src"; continue; }
     ln -s "$src" "$NEW_DIR/$name"
 done < "$BUILTIN_LIST"
+: > "$ACTIVE_TP_FILE"
 while IFS=$(printf '\t') read -r _ _ name; do
     [ -n "$name" ] || continue
     src="$THIRD_PARTY_DIR/$name"
     [ -d "$src" ] || { log "WARN: missing third-party plugin source: $src"; continue; }
     ln -s "$src" "$NEW_DIR/$name"
+    # Capture the HEAD sha of every plugin we actually link in, so the
+    # manifest hash reflects only the live set (not stale cache leftovers).
+    if sha=$(as_app git -c safe.directory='*' -C "$src" rev-parse HEAD 2>/dev/null); then
+        printf '%s\t%s\n' "$name" "$sha" >> "$ACTIVE_TP_FILE"
+    fi
 done < "$THIRD_PARTY_LIST"
 rm -rf "$PLUGINS_LIVE_DIR"
 mv "$NEW_DIR" "$PLUGINS_LIVE_DIR"
-chown -h "$DISCOURSE_UID:$DISCOURSE_GID" "$PLUGINS_LIVE_DIR"/* 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # 8. Migrations.
@@ -319,7 +326,7 @@ fi
 # ---------------------------------------------------------------------------
 current_hash=$(/usr/local/bin/discourse-manifest-hash \
     --builtin-file "$BUILTIN_LIST" \
-    --third-party-dir "$THIRD_PARTY_DIR")
+    --third-party-file "$ACTIVE_TP_FILE")
 recorded_hash=
 [ -f "$MANIFEST_FILE" ] && recorded_hash=$(cat "$MANIFEST_FILE")
 
@@ -349,7 +356,7 @@ fi
 if [ -n "${CONTAINER_DISCOURSE_ADMIN_EMAIL:-}" ]; then
     log "seeding admin user (idempotent)"
     ( cd "$APP_DIR" && as_app bundle exec rails runner /app/script/seed_admin.rb ) >&2 \
-        || log "WARN: admin seed returned non-zero"
+        || die "admin seed failed (CONTAINER_DISCOURSE_ADMIN_EMAIL was set)"
 fi
 
 log "bootstrap complete"

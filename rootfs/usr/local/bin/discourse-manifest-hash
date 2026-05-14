@@ -12,31 +12,33 @@ set -eu
 
 usage() {
     cat >&2 <<EOF
-Usage: discourse-manifest-hash --builtin-file <path> --third-party-dir <path|"">
+Usage: discourse-manifest-hash --builtin-file <path> --third-party-file <path>
 
-  --builtin-file PATH    File with one bundled-plugin name per line. Names
-                         are sorted and folded into the hash. Pass an empty
-                         file (or one with only blanks) to represent
-                         "no built-in plugins active".
-  --third-party-dir PATH Directory containing cloned third-party plugin
-                         repos (one subdir per plugin). For each subdir,
-                         "<name>\\t<git rev-parse HEAD>" is appended to the
-                         hash input. Pass "" to represent "no third-party".
+  --builtin-file PATH      File with one bundled-plugin name per line. Names
+                           are sorted and folded into the hash. Pass an empty
+                           file (or /dev/null) to represent "no built-in
+                           plugins active".
+  --third-party-file PATH  File with one "<name>\\t<git-sha>" line per active
+                           third-party plugin. The bootstrap pre-resolves SHAs
+                           only for plugins in the live allow-list, so dropped-
+                           but-cached plugins do not poison the hash. Pass
+                           /dev/null to represent "no third-party".
 EOF
 }
 
 builtin_file=
-third_party_dir=
+third_party_file=
 while [ $# -gt 0 ]; do
     case "$1" in
         --builtin-file) builtin_file=$2; shift 2 ;;
-        --third-party-dir) third_party_dir=$2; shift 2 ;;
+        --third-party-file) third_party_file=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage; exit 2 ;;
     esac
 done
 
 [ -n "$builtin_file" ] || { usage; exit 2; }
+[ -n "$third_party_file" ] || { usage; exit 2; }
 
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
@@ -51,20 +53,10 @@ fi
 # empty third-party section don't collide with non-empty inputs.
 printf -- '---third-party---\n' >> "$tmp"
 
-if [ -n "$third_party_dir" ] && [ -d "$third_party_dir" ]; then
-    # For each subdir, capture name + HEAD sha. Skip non-git dirs silently
-    # (they shouldn't exist but we don't want a bad clone to spook the hash).
-    # -c safe.directory='*' suppresses the "dubious ownership" check —
-    # bootstrap runs this helper as root over /data/plugins/* owned by the
-    # discourse user; without the override git refuses and the plugin is
-    # silently skipped, leaving the manifest hash unchanged.
-    for d in "$third_party_dir"/*/; do
-        [ -d "$d" ] || continue
-        name=$(basename "$d")
-        if sha=$(git -c safe.directory='*' -C "$d" rev-parse HEAD 2>/dev/null); then
-            printf '%s\t%s\n' "$name" "$sha"
-        fi
-    done | LC_ALL=C sort >> "$tmp"
+# Third-party: skip blank lines, then sort. The caller is responsible for
+# emitting only entries for currently-active plugins.
+if [ -f "$third_party_file" ]; then
+    awk 'NF > 0' "$third_party_file" | LC_ALL=C sort >> "$tmp"
 fi
 
 if command -v sha256sum >/dev/null 2>&1; then

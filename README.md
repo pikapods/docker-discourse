@@ -1,4 +1,4 @@
-# container-discourse
+# docker-discourse
 
 A standalone, OCI-friendly Docker image for [Discourse](https://github.com/discourse/discourse).
 
@@ -11,8 +11,10 @@ assets at build time for fast cold boot.
 ## Quick start
 
 ```sh
-# 1. Generate a secret_key_base — keep this stable forever.
-export DISCOURSE_SECRET_KEY_BASE=$(openssl rand -hex 64)
+# 1. Seed your local .env from the example, then put a secret_key_base in it.
+#    .env is gitignored; .env.example shows the variables compose.yaml reads.
+cp .env.example .env
+sed -i "s|^DISCOURSE_SECRET_KEY_BASE=.*|DISCOURSE_SECRET_KEY_BASE=$(openssl rand -hex 64)|" .env
 
 # 2. Edit compose.yaml to fill in DISCOURSE_HOSTNAME, SMTP, admin email.
 
@@ -28,7 +30,7 @@ Browse to `http://localhost:3000`. First-boot admin credentials come from
 | Path | Purpose |
 |---|---|
 | `/app` | Discourse source tree (read-only at runtime) |
-| `/app/plugins-core/` | Bundled plugins as shipped by upstream |
+| `/opt/discourse-plugins-core/` | Bundled plugins as shipped by upstream (kept outside Rails root to avoid autoloader double-scanning) |
 | `/app/plugins/` | Active plugin set (symlinks; rebuilt at boot) |
 | `/app/assets-baked/` | Precompiled asset snapshot from build time |
 | `/usr/local/bundle-baked/` | Gem bundle snapshot from build time |
@@ -84,7 +86,7 @@ they pass through unchanged.
 
 | Var | Default | Purpose |
 |---|---|---|
-| `CONTAINER_DISCOURSE_PLUGINS_BUILTIN` | _unset_ → default-6 | Allow-list for bundled plugins. `""` = none, `*` = all, `"checklist,poll"` = exact set |
+| `CONTAINER_DISCOURSE_PLUGINS_BUILTIN` | _unset_ → default-6 (`checklist`, `discourse-details`, `discourse-narrative-bot`, `discourse-presence`, `discourse-reactions`, `styleguide`) | Allow-list for bundled plugins. `""` = none, `*` = all, `"checklist,poll"` = exact set. See [discourse/discourse/plugins](https://github.com/discourse/discourse/tree/main/plugins) for the full list of bundled plugins. |
 | `CONTAINER_DISCOURSE_PLUGINS` | _empty_ | Third-party plugin manifest: `<url>[@<ref>][#<name>]`, comma-separated |
 | `CONTAINER_DISCOURSE_DB_MIGRATE` | `TRUE` | Run `rake db:migrate` at bootstrap |
 | `CONTAINER_DISCOURSE_ENABLE_SIDEKIQ` | `TRUE` | Start the sidekiq longrun |
@@ -104,9 +106,9 @@ plugin change runs all three, and the manifest hash is stored in
 
 ### Bundled vs third-party
 
-Discourse ships ~43 plugins under `plugins/` in the source tree
+Discourse ships ~43 plugins under [`plugins/` in the source tree](https://github.com/discourse/discourse/tree/main/plugins)
 ("bundled") — `chat`, `discourse-ai`, `discourse-narrative-bot`, ... These
-are all baked into the image at `/app/plugins-core/`. Use
+are all baked into the image at `/opt/discourse-plugins-core/`. Use
 `CONTAINER_DISCOURSE_PLUGINS_BUILTIN` to choose which ones are active:
 
 - _unset_ → the default-6 (`checklist`, `discourse-details`,
@@ -117,7 +119,7 @@ are all baked into the image at `/app/plugins-core/`. Use
 - `""` (empty) → all bundled plugins disabled. Triggers one rebuild.
 - `"checklist,poll"` → only those two. Short aliases work too
   (`narrative-bot` resolves to `discourse-narrative-bot`).
-- `"*"` → every plugin in `/app/plugins-core/`. Heavy first rebuild;
+- `"*"` → every plugin in `/opt/discourse-plugins-core/`. Heavy first rebuild;
   subsequent boots fast.
 
 Third-party plugins are listed in `CONTAINER_DISCOURSE_PLUGINS`:

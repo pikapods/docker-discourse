@@ -17,7 +17,7 @@ HEALTHY_DEADLINE_S = 120
 FAST_READY_DEADLINE_S = 60  # second boots after seeding
 
 DEFAULT_PLUGINS = {
-    "checklist", "discourse-details", "discourse-narrative-bot", "poll",
+    "checklist", "discourse-details", "discourse-narrative-bot",
     "discourse-presence", "discourse-reactions", "styleguide",
 }
 
@@ -272,7 +272,7 @@ def test_pitchfork_master_alive(stack):
 # ---------------------------------------------------------------------------
 
 def test_first_boot_did_not_rebuild(stack):
-    """The default-7 surface matches the baked manifest. The bootstrap
+    """The default-6 surface matches the baked manifest. The bootstrap
     must NOT have run bundle install / themes:update on first boot."""
     logs = _logs(stack["app"])
     assert "plugin manifest unchanged" in logs, (
@@ -290,14 +290,14 @@ def test_default_plugin_symlinks(stack):
 
 
 def test_manifest_matches_baked(stack):
-    a = _exec(stack["app"], "cat", "/data/.plugin-manifest")
+    a = _exec(stack["app"], "cat", "/data/cache/.plugin-manifest")
     b = _exec(stack["app"], "cat", "/app/baked-plugin-manifest")
     assert a.returncode == 0 and b.returncode == 0
     assert a.stdout.strip() == b.stdout.strip(), "/data/.plugin-manifest drifted from baked"
 
 
 def test_data_seeded(stack):
-    for p in ("/data/cache/bundle/ruby", "/data/cache/assets", "/data/.plugin-manifest"):
+    for p in ("/data/cache/bundle/ruby", "/data/cache/assets", "/data/cache/.plugin-manifest"):
         r = _exec(stack["app"], "sh", "-c", f"test -e {p}")
         assert r.returncode == 0, f"{p} missing after first boot"
 
@@ -369,7 +369,7 @@ def test_lifecycle_empty_disables_all(lifecycle):
 def test_lifecycle_star_enables_all(lifecycle):
     port = lifecycle.restart_app({"CONTAINER_DISCOURSE_PLUGINS_BUILTIN": "*"})
     _wait_http_200(f"http://127.0.0.1:{port}/srv/status", READY_DEADLINE_S)
-    core = _exec(lifecycle.app, "sh", "-c", "ls -A /app/plugins-core | wc -l")
+    core = _exec(lifecycle.app, "sh", "-c", "ls -A /opt/discourse-plugins-core | wc -l")
     live = _exec(lifecycle.app, "sh", "-c", "ls -A /app/plugins | wc -l")
     assert core.stdout.strip() == live.stdout.strip(), \
         f"'*' did not symlink every core plugin (core={core.stdout!r} live={live.stdout!r})"

@@ -59,14 +59,12 @@ services:
       CONTAINER_DISCOURSE_ADMIN_PASSWORD: changeme
       CONTAINER_DISCOURSE_ADMIN_USERNAME: admin
 
-      # Optional: third-party plugins. Each entry: <git_url>[@<ref>][#<name>].
-      # Uncomment to demo the runtime-install path.
-      CONTAINER_DISCOURSE_PLUGINS: >-
-        https://github.com/discourse/discourse-prometheus@main,
-        https://github.com/discourse/discourse-bbcode@main
+      # Optional: third-party plugins. Comma-separated list of
+      # <git_url>[@<ref>][#<name>] entries. Uncomment to demo the runtime-install path.
+      # CONTAINER_DISCOURSE_PLUGINS: https://github.com/discourse/discourse-bbcode@main
 
       # Optional: control which bundled plugins are active.
-      # Unset → default-7. "" → none. "*" → all. "checklist,poll" → subset.
+      # Unset → default-6. "" → none. "*" → all. "checklist,poll" → subset.
       # CONTAINER_DISCOURSE_PLUGINS_BUILTIN: "*"
     volumes:
       - discourse-data:/data
