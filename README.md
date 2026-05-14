@@ -1,9 +1,5 @@
 # docker-discourse
 
-This image is maintained by [PikaPods](https://www.pikapods.com/), where Discourse
-is also available as a managed app from **$5.3/month** — no setup, automatic
-updates, your own backups.
-
 A standalone, OCI-friendly Docker image for [Discourse](https://github.com/discourse/discourse).
 
 Unlike upstream's `discourse_docker` (a bash launcher that owns the
@@ -11,6 +7,10 @@ container lifecycle), this image is a plain container: external Postgres,
 Redis, SMTP, and reverse proxy. It uses Discourse's own `DISCOURSE_*` env
 vars unchanged, runs **Pitchfork** on port 3000, and precompiles core
 assets at build time for fast cold boot.
+
+This image is maintained by [PikaPods](https://www.pikapods.com/), where Discourse
+is also available as a managed app from **$5.3/month** — no setup, automatic
+updates, your own backups.
 
 ## Prebuilt images
 
