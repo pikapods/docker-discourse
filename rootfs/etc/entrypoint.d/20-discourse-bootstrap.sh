@@ -185,18 +185,31 @@ BUILTIN_LIST=$(mktemp)
 ACTIVE_TP_FILE=$(mktemp)
 trap 'rm -f "$BUILTIN_LIST" "${THIRD_PARTY_LIST:-}" "$ACTIVE_TP_FILE"' EXIT
 
-# `${VAR+set}` distinguishes "unset" from "empty" — empty is an explicit
-# opt-out, unset is "give me the defaults".
-if [ -z "${CONTAINER_DISCOURSE_PLUGINS_BUILTIN+set}" ]; then
+# Empty vs unset matters: empty = "no plugins, please"; unset = "give me the
+# baked defaults". `${VAR+set}` is the natural POSIX probe, but it doesn't
+# work here — `with-contenv` is `s6-envdir` underneath, which silently drops
+# variables whose file in /run/s6/container_environment is 0 bytes. So
+# `docker run -e VAR=` arrives at this script as unset, not empty. Probe the
+# envdir directly to recover the explicit-empty case.
+S6_ENV_DIR=/run/s6/container_environment
+if [ -e "$S6_ENV_DIR/CONTAINER_DISCOURSE_PLUGINS_BUILTIN" ]; then
+    builtin_raw=$(cat "$S6_ENV_DIR/CONTAINER_DISCOURSE_PLUGINS_BUILTIN")
+    builtin_set=yes
+else
+    builtin_raw=
+    builtin_set=no
+fi
+if [ "$builtin_set" = "no" ]; then
     log "CONTAINER_DISCOURSE_PLUGINS_BUILTIN unset; using baked default-6"
     cp "$BAKED_DEFAULT_PLUGINS" "$BUILTIN_LIST"
-elif [ -z "$CONTAINER_DISCOURSE_PLUGINS_BUILTIN" ]; then
+elif [ -z "$builtin_raw" ]; then
     log "CONTAINER_DISCOURSE_PLUGINS_BUILTIN empty; disabling all bundled plugins"
     : > "$BUILTIN_LIST"
-elif [ "$CONTAINER_DISCOURSE_PLUGINS_BUILTIN" = "*" ]; then
+elif [ "$builtin_raw" = "*" ]; then
     log "CONTAINER_DISCOURSE_PLUGINS_BUILTIN=*; enabling every bundled plugin"
     ( cd "$PLUGINS_CORE_DIR" && ls -1 ) > "$BUILTIN_LIST"
 else
+    CONTAINER_DISCOURSE_PLUGINS_BUILTIN=$builtin_raw
     # Split on commas + whitespace, dropping blanks. Empty entries (",,")
     # are tolerated so block-scalar yaml works.
     printf '%s\n' "$CONTAINER_DISCOURSE_PLUGINS_BUILTIN" \
