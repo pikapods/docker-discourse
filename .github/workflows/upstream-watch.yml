@@ -1,0 +1,187 @@
+name: Upstream watch
+
+on:
+  schedule:
+    - cron: "28 * * * *"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  RUBY_VERSION: "3.4"
+  # Two independent triggers:
+  #
+  # 1. New-version detection. Forward-only 24h window keyed on a tag's
+  #    committedDate — reacts to releases pushed since the previous
+  #    cycle, so it does not backfill historical tags on rollout.
+  #    Discourse moves to a new CalVer minor monthly, so no SERIES gate;
+  #    a strict ^v[0-9]{4}\.[0-9]+\.[0-9]+$ regex rejects pre-CalVer
+  #    semver (v3.x.x[.betaN]), pre-release markers (vYYYY.M.0-latest[.N]),
+  #    and force-moved branch aliases (release, stable, beta,
+  #    latest-release, esr, tests-passed). Use workflow_dispatch on
+  #    build.yml directly for one-off or out-of-shape builds.
+  #
+  # 2. Base-image drift detection. Resolves the current ruby:<minor>-slim-trixie
+  #    digest and compares against the digest recorded in the published
+  #    image's OCI labels. Drift is scoped to the latest CalVer release
+  #    only — older patch releases are not rebuilt on drift. The rebuild
+  #    bumps the immutable -rN suffix and refreshes the mutable
+  #    <version> tag in place, so users pinned to v2026.4.0 receive
+  #    Debian/Ruby security patches without re-pinning.
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+      packages: read
+    steps:
+      - uses: imjasonh/setup-crane@v0.4
+
+      - name: Find builds to trigger
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          BASE_REF="ruby:${RUBY_VERSION}-slim-trixie"
+          current_digest=$(crane digest "${BASE_REF}")
+          echo "current base digest: ${current_digest}"
+
+          cutoff=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+
+          # Fetch tag names + their target commit dates in a single
+          # GraphQL call. TAG_COMMIT_DATE DESC orders by actual recency,
+          # sidestepping the lexicographic trap where ALPHABETICAL DESC
+          # surfaces v3.6.x before v2026.x.x ('v3' > 'v2'). 50 tags
+          # covers a full release cycle with margin (end-of-month
+          # bursts release ~5 patch tags at once).
+          all_tags_json=$(gh api graphql -f query='
+            {
+              repository(owner: "discourse", name: "discourse") {
+                refs(refPrefix: "refs/tags/", first: 50, orderBy: {field: TAG_COMMIT_DATE, direction: DESC}) {
+                  nodes {
+                    name
+                    target {
+                      ... on Commit { committedDate }
+                      ... on Tag { target { ... on Commit { committedDate } } }
+                    }
+                  }
+                }
+              }
+            }')
+
+          # Project to {name, date} so the rest of the script is shape-stable.
+          all_tags=$(echo "${all_tags_json}" | jq -c '[
+            .data.repository.refs.nodes[]
+            | {name, date: (.target.committedDate // .target.target.committedDate)}
+          ]')
+
+          mapfile -t recent < <(
+            echo "${all_tags}" \
+              | jq -r --arg cutoff "${cutoff}" '.[] | select(.date >= $cutoff) | .name'
+          )
+
+          token=$(curl -fsS "https://${REGISTRY}/token?service=${REGISTRY}&scope=repository:${IMAGE_NAME}:pull" | jq -r .token)
+
+          pending=()
+          declare -A reasons=()
+
+          # --- 1. New-version detection ---
+          for upstream in "${recent[@]}"; do
+            [ -n "${upstream}" ] || continue
+            # Strict CalVer allow-list. Exactly two accepted shapes:
+            #   vYYYY.M.0   monthly stable cut
+            #   vYYYY.M.X   patch to a prior minor (X >= 1)
+            # Everything else is rejected on purpose — see workflow
+            # header comment for the rationale per excluded ref shape.
+            if ! [[ "$upstream" =~ ^v[0-9]{4}\.[0-9]+\.[0-9]+$ ]]; then
+              echo "${upstream} not a CalVer release; skipping"
+              continue
+            fi
+
+            status=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${token}" \
+              -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+              -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+              "https://${REGISTRY}/v2/${IMAGE_NAME}/manifests/${upstream}")
+
+            if [ "${status}" = "200" ]; then
+              echo "${upstream} already published"
+            else
+              echo "${upstream} not in registry (HTTP ${status}); will trigger build"
+              pending+=("${upstream}")
+              reasons["${upstream}"]="new-version"
+            fi
+          done
+
+          # --- 2. Base-image drift detection (latest CalVer overall) ---
+          # sort -V puts v2026.4.0 after v3.5.4 numerically (3 < 2026),
+          # but the 4-digit-year regex already rules out legacy semver.
+          latest_stable=$(
+            echo "${all_tags}" \
+              | jq -r '.[].name' \
+              | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -n 1 || true
+          )
+
+          drift_skip=""
+          if [ -z "${latest_stable}" ]; then
+            drift_skip="no CalVer release found in recent tags"
+          elif [ "${#pending[@]}" -gt 0 ] && printf '%s\n' "${pending[@]}" | grep -qFx "${latest_stable}"; then
+            drift_skip="${latest_stable} already pending as new-version"
+          fi
+
+          if [ -n "${drift_skip}" ]; then
+            echo "drift check skipped: ${drift_skip}"
+          else
+            cfg=$(crane config "${REGISTRY}/${IMAGE_NAME}:${latest_stable}" 2>/dev/null || true)
+            if [ -z "${cfg}" ]; then
+              echo "${latest_stable} not yet in registry; drift check N/A"
+            else
+              published_digest=$(echo "${cfg}" | jq -r '.config.Labels["org.opencontainers.image.base.digest"] // empty')
+              if [ "${published_digest}" = "${current_digest}" ]; then
+                echo "${latest_stable} base digest matches (${current_digest}); no drift"
+              else
+                echo "${latest_stable} base drift: published=${published_digest:-<none>} current=${current_digest}; will trigger rebuild"
+                pending+=("${latest_stable}")
+                reasons["${latest_stable}"]="base-drift"
+              fi
+            fi
+          fi
+
+          if [ "${#pending[@]}" -eq 0 ]; then
+            echo "nothing to build"
+            exit 0
+          fi
+
+          echo "triggering builds:"
+          for tag in "${pending[@]}"; do
+            echo "  - ${tag} (${reasons[$tag]})"
+          done
+
+          {
+            echo "pending<<EOF"
+            printf '%s\n' "${pending[@]}"
+            echo "EOF"
+            echo "base_digest=${current_digest}"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Trigger builds
+        if: steps.check.outputs.pending != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PENDING: ${{ steps.check.outputs.pending }}
+          BASE_DIGEST: ${{ steps.check.outputs.base_digest }}
+        run: |
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            gh workflow run build.yml \
+              --repo "${GITHUB_REPOSITORY}" \
+              -f discourse_version="$tag" \
+              -f ruby_version="${RUBY_VERSION}" \
+              -f base_digest="${BASE_DIGEST}"
+          done <<<"$PENDING"

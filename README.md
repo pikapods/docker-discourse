@@ -21,10 +21,17 @@ ghcr.io/pikapods/docker-discourse:<tag>
 docker.io/pikapods/docker-discourse:<tag>
 ```
 
-Tags follow upstream's calendar versioning (`v2026.4.0`) plus a `latest`
-alias for the most recent build. `compose.yaml` defaults to
-`ghcr.io/pikapods/docker-discourse:latest`; override with the
-`DISCOURSE_IMAGE` env var.
+Tags follow upstream's calendar versioning (`v2026.4.0`). Three tag
+patterns are pushed per build:
+
+| Tag             | Mutability | Use for                                                       |
+|-----------------|------------|---------------------------------------------------------------|
+| `latest`        | mutable    | Most recent build of the most recent CalVer release           |
+| `v2026.4.0`     | mutable    | Pin to a Discourse version; auto-receive base-image patches   |
+| `v2026.4.0-r1`  | immutable  | Byte-for-byte reproducibility; never reused                   |
+
+`compose.yaml` defaults to `ghcr.io/pikapods/docker-discourse:latest`;
+override with the `DISCOURSE_IMAGE` env var.
 
 ## Quick start
 

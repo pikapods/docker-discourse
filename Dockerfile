@@ -9,6 +9,10 @@
 
 ARG RUBY_VERSION=3.4
 ARG NODE_VERSION=24
+# BASE_IMAGE is composed by build.yml as ruby:<minor>-slim-trixie optionally
+# suffixed with @sha256:... when the watcher resolved a digest. Local builds
+# without a digest fall through to the floating tag.
+ARG BASE_IMAGE=ruby:${RUBY_VERSION}-slim-trixie
 # Discourse moved to calendar-versioned tags (vYYYY.M.PATCH). The rolling
 # "release" tag points at the current stable build; CI overrides this
 # with a dated tag at dispatch time.
@@ -19,7 +23,7 @@ ARG DISCOURSE_GID=1000
 ARG S6_OVERLAY_VERSION=3.2.0.2
 
 # ── Stage 1: builder ────────────────────────────────────────────────────────
-FROM ruby:${RUBY_VERSION}-slim-trixie AS builder
+FROM ${BASE_IMAGE} AS builder
 ARG DISCOURSE_VERSION
 ARG DISCOURSE_REPO
 ARG NODE_VERSION
@@ -111,18 +115,32 @@ RUN /usr/local/bin/discourse-manifest-hash \
       > /app/baked-plugin-manifest
 
 # ── Stage 2: runtime ────────────────────────────────────────────────────────
-FROM ruby:${RUBY_VERSION}-slim-trixie AS runtime
+FROM ${BASE_IMAGE} AS runtime
 ARG DISCOURSE_UID
 ARG DISCOURSE_GID
 ARG NODE_VERSION
+ARG RUBY_VERSION
 ARG S6_OVERLAY_VERSION
 ARG DISCOURSE_VERSION
+
+# Build identity. IMAGE_REVISION is bumped by build.yml when the same
+# DISCOURSE_VERSION is rebuilt against a new base digest (security patch).
+# BASE_DIGEST is the resolved sha256 the FROM line pinned to; upstream-watch
+# reads it back off the published image to detect base-image drift.
+ARG IMAGE_REVISION=r1
+ARG BASE_DIGEST=
+ARG GIT_SHA=
+ARG BUILD_DATE=
 
 LABEL org.opencontainers.image.title="Discourse" \
       org.opencontainers.image.description="Standalone, 12-factor Discourse container" \
       org.opencontainers.image.source="https://github.com/pikapods/docker-discourse" \
       org.opencontainers.image.licenses="GPL-2.0" \
-      org.opencontainers.image.version="${DISCOURSE_VERSION}"
+      org.opencontainers.image.version="${DISCOURSE_VERSION}-${IMAGE_REVISION}" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.base.name="ruby:${RUBY_VERSION}-slim-trixie" \
+      org.opencontainers.image.base.digest="${BASE_DIGEST}"
 
 # Runtime libs + the same toolchain the builder used. The toolchain is
 # retained on purpose: runtime plugin install needs to compile native gems
