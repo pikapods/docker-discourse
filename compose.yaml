@@ -37,35 +37,22 @@ services:
       redis:
         condition: service_healthy
     environment:
-      # Required.
       DISCOURSE_HOSTNAME: localhost
-      DISCOURSE_PORT: 3000
       DISCOURSE_DB_HOST: postgres
       DISCOURSE_DB_USERNAME: discourse
       DISCOURSE_DB_PASSWORD: changeme
       DISCOURSE_DB_NAME: discourse
       DISCOURSE_REDIS_HOST: redis
-      DISCOURSE_SMTP_ADDRESS: host.containers.internal
-      DISCOURSE_SMTP_PORT: 1025
-      DISCOURSE_SMTP_ENABLE_START_TLS: "false"
-      DISCOURSE_SMTP_OPENSSL_VERIFY_MODE: none
       DISCOURSE_DEVELOPER_EMAILS: admin@example.com
       # Generate once with `openssl rand -hex 64` and keep stable across recreates.
       # Rotating this value invalidates sessions and corrupts encrypted columns.
       DISCOURSE_SECRET_KEY_BASE: ${DISCOURSE_SECRET_KEY_BASE:?DISCOURSE_SECRET_KEY_BASE must be set (openssl rand -hex 64)}
 
-      # First-boot admin (idempotent — skipped if any admin already exists).
+      # First-boot admin seed. Idempotent — skipped once any admin exists.
+      # Password must be >= 15 chars (Discourse's min_admin_password_length default).
       CONTAINER_DISCOURSE_ADMIN_EMAIL: admin@example.com
-      CONTAINER_DISCOURSE_ADMIN_PASSWORD: changeme
+      CONTAINER_DISCOURSE_ADMIN_PASSWORD: changemechangeme
       CONTAINER_DISCOURSE_ADMIN_USERNAME: admin
-
-      # Optional: third-party plugins. Comma-separated list of
-      # <git_url>[@<ref>][#<name>] entries. Uncomment to demo the runtime-install path.
-      # CONTAINER_DISCOURSE_PLUGINS: https://github.com/discourse/discourse-bbcode@main
-
-      # Optional: control which bundled plugins are active.
-      # Unset → default-6. "" → none. "*" → all. "checklist,poll" → subset.
-      # CONTAINER_DISCOURSE_PLUGINS_BUILTIN: "*"
     volumes:
       - discourse-data:/data
     ports:

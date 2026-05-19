@@ -89,7 +89,6 @@ organisation. Logs go to stdout.
 | `DISCOURSE_DB_PASSWORD` | |
 | `DISCOURSE_DB_NAME` | |
 | `DISCOURSE_REDIS_HOST` | |
-| `DISCOURSE_SMTP_ADDRESS` | |
 | `DISCOURSE_DEVELOPER_EMAILS` | Comma-separated; these accounts become admins on signup |
 | `DISCOURSE_SECRET_KEY_BASE` | **Env-only, no fallback.** Generate once with `openssl rand -hex 64` and keep it stable. Rotating it invalidates sessions and breaks encrypted columns. |
 
@@ -98,7 +97,8 @@ organisation. Logs go to stdout.
 `DISCOURSE_PORT` (Pitchfork listen port; defaults to 3000),
 `DISCOURSE_DB_PORT`, `DISCOURSE_DB_POOL`,
 `DISCOURSE_REDIS_PORT`, `DISCOURSE_REDIS_PASSWORD`, `DISCOURSE_REDIS_USE_SSL`,
-`DISCOURSE_SMTP_PORT`, `DISCOURSE_SMTP_USER_NAME` (note the underscore — canonical upstream spelling),
+`DISCOURSE_SMTP_ADDRESS`, `DISCOURSE_SMTP_PORT`,
+`DISCOURSE_SMTP_USER_NAME` (note the underscore — canonical upstream spelling),
 `DISCOURSE_SMTP_PASSWORD`, `DISCOURSE_SMTP_DOMAIN`, `DISCOURSE_SMTP_AUTHENTICATION`,
 `DISCOURSE_SMTP_ENABLE_START_TLS`, `DISCOURSE_SMTP_FORCE_TLS`,
 `DISCOURSE_SMTP_OPENSSL_VERIFY_MODE`,
@@ -107,6 +107,12 @@ organisation. Logs go to stdout.
 
 All `DISCOURSE_*` vars are read directly by Discourse's `config/discourse.conf`;
 they pass through unchanged.
+
+Outbound mail is disabled until `DISCOURSE_SMTP_ADDRESS` is set: Discourse
+falls back to `:sendmail` delivery, and this slim image does not ship a
+sendmail binary. The app boots fine without it, but password resets,
+notifications, and signup confirmations will not be delivered. Configure
+SMTP before exposing the instance to real users.
 
 ### Image-owned `CONTAINER_DISCOURSE_*`
 
