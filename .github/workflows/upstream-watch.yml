@@ -18,8 +18,12 @@ env:
   #    a strict ^v[0-9]{4}\.[0-9]+\.[0-9]+$ regex rejects pre-CalVer
   #    semver (v3.x.x[.betaN]), pre-release markers (vYYYY.M.0-latest[.N]),
   #    and force-moved branch aliases (release, stable, beta,
-  #    latest-release, esr, tests-passed). Use workflow_dispatch on
-  #    build.yml directly for one-off or out-of-shape builds.
+  #    latest-release, esr, tests-passed). The rolling refresh is further
+  #    scoped to the two newest CalVer minors (release + stable lines);
+  #    ESR and older minors are operator-triggered only because the
+  #    plugin ecosystem our runtime tests exercise drops compat with
+  #    them. Use workflow_dispatch on build.yml directly for one-off or
+  #    out-of-shape builds.
   #
   # 2. Base-image drift detection. Resolves the current ruby:<minor>-slim-trixie
   #    digest and compares against the digest recorded in the published
@@ -86,6 +90,25 @@ jobs:
 
           token=$(curl -fsS "https://${REGISTRY}/token?service=${REGISTRY}&scope=repository:${IMAGE_NAME}:pull" | jq -r .token)
 
+          # Auto-build window: the two newest CalVer minor prefixes present
+          # in the recent-tags response. Discourse cuts patches for several
+          # release lines on the same day (release, stable, esr, beta);
+          # we only follow release + stable here. ESR and older minors are
+          # operator-triggered only via workflow_dispatch — their plugin
+          # ecosystem (e.g. discourse-prometheus) has dropped compat with
+          # those Discourse versions, so our runtime tests can't validate
+          # them. sort -V handles year boundaries since CalVer years are
+          # fixed four-digit.
+          allowed_minors=$(
+            echo "${all_tags}" \
+              | jq -r '.[].name' \
+              | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+$' \
+              | sed -E 's/^(v[0-9]+\.[0-9]+)\..*/\1/' \
+              | sort -Vu \
+              | tail -n 2
+          )
+          echo "auto-build window: $(echo "${allowed_minors}" | tr '\n' ' ')"
+
           pending=()
           declare -A reasons=()
 
@@ -99,6 +122,12 @@ jobs:
             # header comment for the rationale per excluded ref shape.
             if ! [[ "$upstream" =~ ^v[0-9]{4}\.[0-9]+\.[0-9]+$ ]]; then
               echo "${upstream} not a CalVer release; skipping"
+              continue
+            fi
+
+            upstream_minor=$(echo "${upstream}" | sed -E 's/^(v[0-9]+\.[0-9]+)\..*/\1/')
+            if ! grep -qFx "${upstream_minor}" <<<"${allowed_minors}"; then
+              echo "${upstream} minor outside auto-build window; skipping"
               continue
             fi
 
