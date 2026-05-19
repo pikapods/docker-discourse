@@ -693,10 +693,11 @@ def test_lifecycle_repaired_cache_forces_rebuild(lifecycle):
     r = _exec(lifecycle.app, "rm", "-rf", "/data/cache/bundle")
     assert r.returncode == 0, r.stderr
 
-    pre = _logs(lifecycle.app)
     # Restart with the SAME env so manifest hash matches recorded_hash —
     # without the caches_repaired guard, the unchanged branch would fire
     # and the missing bundle would never be repopulated.
+    # restart_app recreates the container (docker rm -f + run), so its
+    # logs already start at the second boot — no pre/tail slicing needed.
     port = lifecycle.restart_app({
         "CONTAINER_DISCOURSE_PLUGINS_BUILTIN": "",
         "CONTAINER_DISCOURSE_PLUGINS": (
@@ -704,7 +705,7 @@ def test_lifecycle_repaired_cache_forces_rebuild(lifecycle):
         ),
     })
     _wait_http_200(f"http://127.0.0.1:{port}/srv/status", READY_DEADLINE_S)
-    tail = _logs(lifecycle.app)[len(pre):]
+    tail = _logs(lifecycle.app)
 
     assert "caches were repaired; forcing rebuild" in tail, (
         f"expected forced rebuild log on repaired cache:\n{tail[-3000:]}"
