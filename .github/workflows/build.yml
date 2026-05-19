@@ -27,6 +27,11 @@ on:
         required: false
         default: ""
         type: string
+      publish_latest:
+        description: "Also move the floating :latest tag to this build. Default false; only the highest published CalVer should ever set this true."
+        required: false
+        default: false
+        type: boolean
 
 # Serialize builds so revision computation can't race itself: two concurrent
 # runs against the same DC_VER would otherwise both read 'r2' and both
@@ -318,21 +323,25 @@ jobs:
       #                          to the latest revision so base-image security
       #                          rebuilds land in place — users pinned here
       #                          receive Debian/Ruby patches without re-pinning.
-      #   latest                 floating pointer. The dispatch regex above and
-      #                          the upstream-watch filter both restrict to
-      #                          immutable CalVer, so 'latest' only ever moves
-      #                          to a real stable release.
+      #   latest                 floating pointer. Gated on the publish_latest
+      #                          input — upstream-watch sets it true only when
+      #                          the dispatched tag equals its computed
+      #                          latest_stable. Default false means manual
+      #                          dispatches do not move ':latest' unless asked.
       - name: Tag and push
         env:
           DC_VER: ${{ needs.build.outputs.discourse_version }}
           REVISION: ${{ needs.build.outputs.revision }}
+          PUBLISH_LATEST: ${{ inputs.publish_latest }}
         run: |
           set -euo pipefail
           for REPO in "${GHCR_IMAGE}" "${DOCKERHUB_IMAGE}"; do
             docker tag docker-discourse:test "${REPO}:${DC_VER}-${REVISION}"
             docker tag docker-discourse:test "${REPO}:${DC_VER}"
-            docker tag docker-discourse:test "${REPO}:latest"
             docker push "${REPO}:${DC_VER}-${REVISION}"
             docker push "${REPO}:${DC_VER}"
-            docker push "${REPO}:latest"
+            if [ "${PUBLISH_LATEST}" = "true" ]; then
+              docker tag docker-discourse:test "${REPO}:latest"
+              docker push "${REPO}:latest"
+            fi
           done

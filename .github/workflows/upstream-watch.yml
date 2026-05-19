@@ -168,6 +168,7 @@ jobs:
             printf '%s\n' "${pending[@]}"
             echo "EOF"
             echo "base_digest=${current_digest}"
+            echo "latest_stable=${latest_stable}"
           } >>"$GITHUB_OUTPUT"
 
       - name: Trigger builds
@@ -176,12 +177,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PENDING: ${{ steps.check.outputs.pending }}
           BASE_DIGEST: ${{ steps.check.outputs.base_digest }}
+          LATEST_STABLE: ${{ steps.check.outputs.latest_stable }}
         run: |
           while IFS= read -r tag; do
             [ -n "$tag" ] || continue
+            if [ -n "$LATEST_STABLE" ] && [ "$tag" = "$LATEST_STABLE" ]; then
+              publish_latest=true
+            else
+              publish_latest=false
+            fi
             gh workflow run build.yml \
               --repo "${GITHUB_REPOSITORY}" \
               -f discourse_version="$tag" \
               -f ruby_version="${RUBY_VERSION}" \
-              -f base_digest="${BASE_DIGEST}"
+              -f base_digest="${BASE_DIGEST}" \
+              -f publish_latest="${publish_latest}"
           done <<<"$PENDING"
