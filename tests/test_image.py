@@ -117,6 +117,7 @@ class TestImageFilesystem:
         "/app/config/application.rb",
         "/app/baked-default-plugins",
         "/app/baked-plugin-manifest",
+        "/app/baked-image-fingerprint",
         "/usr/local/bin/discourse-manifest-hash",
         "/usr/local/bundle-baked",
         "/app/assets-baked",
@@ -163,6 +164,7 @@ class TestImageFilesystem:
             "sh", "-c",
             "/usr/local/bin/discourse-manifest-hash "
             "--builtin-file /app/baked-default-plugins --third-party-file /dev/null "
+            "--image-fingerprint-file /app/baked-image-fingerprint "
             "&& cat /app/baked-plugin-manifest"
         )
         assert r.returncode == 0, r.stderr

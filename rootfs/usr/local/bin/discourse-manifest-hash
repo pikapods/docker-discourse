@@ -1,10 +1,11 @@
 #!/bin/sh
 # discourse-manifest-hash — single source of truth for the plugin manifest hash.
 #
-# Computes a sha256 over: sorted built-in plugin names + sorted
-# "<third-party-name>\t<git HEAD sha>" pairs. Used at build time to bake
-# /app/baked-plugin-manifest, and at runtime by the bootstrap script to
-# decide whether the bundle install + asset precompile needs to rerun.
+# Computes a sha256 over three sections: sorted built-in plugin names, sorted
+# "<third-party-name>\t<git HEAD sha>" pairs, and the image fingerprint. Used
+# at build time to bake /app/baked-plugin-manifest, and at runtime by the
+# bootstrap script to decide whether the bundle install + asset precompile
+# needs to rerun.
 #
 # Both call sites MUST invoke this helper to avoid drift — any change to
 # the hashing rules belongs here, nowhere else.
@@ -12,26 +13,33 @@ set -eu
 
 usage() {
     cat >&2 <<EOF
-Usage: discourse-manifest-hash --builtin-file <path> --third-party-file <path>
+Usage: discourse-manifest-hash --builtin-file <path> --third-party-file <path> \\
+                               --image-fingerprint-file <path>
 
-  --builtin-file PATH      File with one bundled-plugin name per line. Names
-                           are sorted and folded into the hash. Pass an empty
-                           file (or /dev/null) to represent "no built-in
-                           plugins active".
-  --third-party-file PATH  File with one "<name>\\t<git-sha>" line per active
-                           third-party plugin. The bootstrap pre-resolves SHAs
-                           only for plugins in the live allow-list, so dropped-
-                           but-cached plugins do not poison the hash. Pass
-                           /dev/null to represent "no third-party".
+  --builtin-file PATH            File with one bundled-plugin name per line. Names
+                                 are sorted and folded into the hash. Pass an empty
+                                 file (or /dev/null) to represent "no built-in
+                                 plugins active".
+  --third-party-file PATH        File with one "<name>\\t<git-sha>" line per active
+                                 third-party plugin. The bootstrap pre-resolves SHAs
+                                 only for plugins in the live allow-list, so dropped-
+                                 but-cached plugins do not poison the hash. Pass
+                                 /dev/null to represent "no third-party".
+  --image-fingerprint-file PATH  File whose contents are appended verbatim as a
+                                 third hashed section. Build and runtime pass the
+                                 same /app/baked-image-fingerprint so the hash
+                                 changes on Discourse/gem/asset/base upgrades.
 EOF
 }
 
 builtin_file=
 third_party_file=
+image_fingerprint_file=
 while [ $# -gt 0 ]; do
     case "$1" in
         --builtin-file) builtin_file=$2; shift 2 ;;
         --third-party-file) third_party_file=$2; shift 2 ;;
+        --image-fingerprint-file) image_fingerprint_file=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage; exit 2 ;;
     esac
@@ -39,6 +47,7 @@ done
 
 [ -n "$builtin_file" ] || { usage; exit 2; }
 [ -n "$third_party_file" ] || { usage; exit 2; }
+[ -n "$image_fingerprint_file" ] || { usage; exit 2; }
 
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
@@ -49,14 +58,20 @@ if [ -f "$builtin_file" ]; then
         | LC_ALL=C sort -u >> "$tmp"
 fi
 
-# Separator between the two sections so an empty builtin section and an
-# empty third-party section don't collide with non-empty inputs.
+# Separator between sections so an empty builtin section and an empty
+# third-party section don't collide with non-empty inputs.
 printf -- '---third-party---\n' >> "$tmp"
 
 # Third-party: skip blank lines, then sort. The caller is responsible for
 # emitting only entries for currently-active plugins.
 if [ -f "$third_party_file" ]; then
     awk 'NF > 0' "$third_party_file" | LC_ALL=C sort >> "$tmp"
+fi
+
+printf -- '---image-fingerprint---\n' >> "$tmp"
+
+if [ -f "$image_fingerprint_file" ]; then
+    cat "$image_fingerprint_file" >> "$tmp"
 fi
 
 if command -v sha256sum >/dev/null 2>&1; then

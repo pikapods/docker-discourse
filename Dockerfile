@@ -27,6 +27,11 @@ FROM ${BASE_IMAGE} AS builder
 ARG DISCOURSE_VERSION
 ARG DISCOURSE_REPO
 ARG NODE_VERSION
+# Pulled into the builder stage too so they participate in
+# /app/baked-image-fingerprint. The runtime stage still declares them
+# for its LABEL block.
+ARG IMAGE_REVISION=r1
+ARG BASE_DIGEST=
 ENV LANG=C.UTF-8 \
     RAILS_ENV=production \
     NODE_ENV=production
@@ -109,6 +114,34 @@ RUN SKIP_DB_AND_REDIS=1 \
 # it raises Errno::ENOENT, prints a backtrace on every first boot, and
 # skips the Admin Quick Start pinned topic.
 
+# Hard-fail if assets:precompile didn't leave a precompile manifest —
+# silently degrading the image fingerprint to "Gemfile.lock only" would
+# let two materially-different builds collide on the same hash key.
+# Modern Discourse writes /app/public/assets/.manifest.json (Propshaft)
+# alongside manifest-<digest>.json (Sprockets); we require at least one.
+RUN { [ -f /app/public/assets/.manifest.json ] \
+        || ls /app/public/assets/manifest-*.json >/dev/null 2>&1; } \
+        || { echo "FATAL: no precompile manifest under /app/public/assets after assets:precompile" >&2; exit 1; }
+
+# Image fingerprint covers everything that can invalidate a materialized
+# bundle/asset cache from a prior image:
+#   - Base image identity (BASE_DIGEST + IMAGE_REVISION) — catches
+#     same-Discourse rebuilds against a new base digest
+#   - Ruby version + platform (native extension ABI key)
+#   - Discourse git HEAD (catches code-only changes that miss the other inputs)
+#   - Gemfile.lock contents (gem set + versions)
+#   - Asset precompile manifests (digests of every compiled asset)
+RUN { \
+        printf 'IMAGE_REVISION=%s\n' "${IMAGE_REVISION}"; \
+        printf 'BASE_DIGEST=%s\n'    "${BASE_DIGEST}"; \
+        ruby -e 'puts RUBY_VERSION + " " + RUBY_PLATFORM'; \
+        git -C /app rev-parse HEAD; \
+        sha256sum /app/Gemfile.lock; \
+        ( cd /app/public/assets && \
+            find . -maxdepth 1 \( -name '.manifest.json' -o -name 'manifest-*.json' \) \
+                -print0 | LC_ALL=C sort -z | xargs -0 sha256sum ); \
+    } | sha256sum | awk '{print $1}' > /app/baked-image-fingerprint
+
 # Copy the shared hash helper now so we can bake a manifest matching what
 # bootstrap will compute at runtime. Identical script → identical hash →
 # no spurious rebuild on first boot.
@@ -116,6 +149,7 @@ COPY rootfs/usr/local/bin/discourse-manifest-hash /usr/local/bin/discourse-manif
 RUN /usr/local/bin/discourse-manifest-hash \
         --builtin-file /app/baked-default-plugins \
         --third-party-file /dev/null \
+        --image-fingerprint-file /app/baked-image-fingerprint \
       > /app/baked-plugin-manifest
 
 # ── Stage 2: runtime ────────────────────────────────────────────────────────
@@ -197,8 +231,12 @@ WORKDIR /app
 # from /opt/discourse-plugins-core + /data/plugins.
 #
 # /app/public/assets is symlinked to /data/cache/assets; the baked content
-# is staged at /app/assets-baked so bootstrap can seed it.
-RUN mkdir -p /data/uploads /data/backups /data/plugins /data/cache/bundle /data/cache/assets \
+# is staged at /app/assets-baked so bootstrap can seed it. /data/cache/{bundle,
+# assets} themselves are NOT pre-created — bootstrap's seed_or_link_cache
+# manages them; pre-creating them as empty image dirs would seed a virgin
+# volume with empty real dirs that then fail the validators on first boot
+# and trigger a spurious "exists but failed validator" WARN.
+RUN mkdir -p /data/uploads /data/backups /data/plugins /data/cache \
  && mv /app/public/assets /app/assets-baked \
  && rm -rf /app/public/uploads /app/public/backups \
  && rm -rf /app/plugins && mkdir -p /app/plugins \

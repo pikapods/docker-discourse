@@ -335,6 +335,111 @@ def test_data_seeded(stack):
 
 
 # ---------------------------------------------------------------------------
+# Cache materialization + lifecycle
+#
+# On default-plugin first boot, the bootstrap points /data/cache/{bundle,assets}
+# at the baked image layer via symlink (zero-copy). The expensive rsync only
+# fires on the rebuild branch via materialize_cache. These tests pin the
+# lazy-materialization behaviour described in the plan.
+# ---------------------------------------------------------------------------
+
+def test_first_boot_uses_symlinks(stack):
+    """Default-6 fresh stack: caches should be symlinks pointing at the baked
+    sources, with no seeding/materializing log lines."""
+    r = _exec(stack["app"], "readlink", "/data/cache/bundle")
+    assert r.returncode == 0, f"/data/cache/bundle is not a symlink (stderr={r.stderr!r})"
+    assert r.stdout.strip() == "/usr/local/bundle-baked", \
+        f"unexpected bundle symlink target: {r.stdout.strip()!r}"
+    r = _exec(stack["app"], "readlink", "/data/cache/assets")
+    assert r.returncode == 0, f"/data/cache/assets is not a symlink (stderr={r.stderr!r})"
+    assert r.stdout.strip() == "/app/assets-baked", \
+        f"unexpected assets symlink target: {r.stdout.strip()!r}"
+
+    logs = _logs(stack["app"])
+    assert "seeding bundle cache from" not in logs, \
+        f"eager rsync ran on default boot: {logs[-2000:]}"
+    assert "materializing" not in logs, \
+        f"materialize_cache ran on default boot: {logs[-2000:]}"
+
+
+def test_partial_materialization_tmp_cleaned(stack):
+    """A leftover bundle.new/ from an interrupted prior boot must be removed
+    by the next boot's seed_or_link_cache."""
+    # Plant a bogus .new staging dir as root (rm -rf works regardless of uid).
+    r = _exec(stack["app"], "sh", "-c",
+              "mkdir -p /data/cache/bundle.new && touch /data/cache/bundle.new/junk")
+    assert r.returncode == 0, r.stderr
+    _sh("docker", "restart", stack["app"])
+    port = _host_port(stack["app"], "3000")
+    _wait_http_200(f"http://127.0.0.1:{port}/srv/status", FAST_READY_DEADLINE_S)
+    r = _exec(stack["app"], "sh", "-c", "test -e /data/cache/bundle.new")
+    assert r.returncode != 0, "bundle.new should have been removed on next boot"
+
+
+def test_image_upgrade_default_symlinked_adopts_hash(stack):
+    """Simulate an image upgrade by mutating /app/baked-image-fingerprint
+    (and re-baking /app/baked-plugin-manifest in lockstep). On a default-
+    plugin stack with symlinked caches, the bootstrap should take the
+    fast-adopt branch: log 'adopting hash', no rebuild, no materialization.
+
+    Runs BEFORE test_wrong_symlink_target_replaced because that test forces
+    a cache-repair rebuild which materializes the caches into real dirs."""
+    # /app writes survive `docker restart` (same writable layer) but not
+    # `docker rm -f` — so this is a docker restart test.
+    r = _exec(stack["app"], "sh", "-c",
+              "echo deadbeef > /app/baked-image-fingerprint && "
+              "/usr/local/bin/discourse-manifest-hash "
+              "--builtin-file /app/baked-default-plugins "
+              "--third-party-file /dev/null "
+              "--image-fingerprint-file /app/baked-image-fingerprint "
+              "> /app/baked-plugin-manifest")
+    assert r.returncode == 0, r.stderr
+
+    # Capture log length before restart so we can diff the new tail.
+    pre = _logs(stack["app"])
+    _sh("docker", "restart", stack["app"])
+    port = _host_port(stack["app"], "3000")
+    _wait_http_200(f"http://127.0.0.1:{port}/srv/status", FAST_READY_DEADLINE_S)
+
+    tail = _logs(stack["app"])[len(pre):]
+    assert "adopting hash" in tail, (
+        f"expected fast-adopt branch in restart logs:\n{tail[-3000:]}"
+    )
+    assert "Bundle complete!" not in tail, "rebuild ran on fast-adopt path"
+    assert "materializing" not in tail, "materialization ran on fast-adopt path"
+
+    # Caches must remain symlinks.
+    for sub in ("bundle", "assets"):
+        r = _exec(stack["app"], "test", "-L", f"/data/cache/{sub}")
+        assert r.returncode == 0, f"/data/cache/{sub} no longer a symlink"
+
+
+def test_wrong_symlink_target_replaced(stack):
+    """A symlink pointing somewhere other than the expected baked source
+    must be replaced with the correct link, logged as WARN. Runs after the
+    fast-adopt test because the cache-repair path triggers a full rebuild
+    which materializes the caches into real dirs."""
+    # Swap to a bogus target. /etc exists in every container so the link
+    # resolves to something — we're testing the target-validation, not
+    # dangling-link handling.
+    r = _exec(stack["app"], "sh", "-c",
+              "rm /data/cache/bundle && ln -s /etc /data/cache/bundle")
+    assert r.returncode == 0, r.stderr
+    _sh("docker", "restart", stack["app"])
+    port = _host_port(stack["app"], "3000")
+    _wait_http_200(f"http://127.0.0.1:{port}/srv/status", READY_DEADLINE_S)
+    logs = _logs(stack["app"])
+    # The bootstrap should have logged the replacement.
+    assert re.search(r"WARN: /data/cache/bundle -> /etc.*replacing", logs), (
+        f"expected WARN about swapped symlink in logs:\n{logs[-3000:]}"
+    )
+    # Caches got rebuilt: bundle is no longer a symlink to /etc (it was
+    # replaced with the baked link, then materialized by the rebuild path).
+    r = _exec(stack["app"], "test", "-e", "/data/cache/bundle/ruby")
+    assert r.returncode == 0, "bundle/ruby missing after repair+rebuild"
+
+
+# ---------------------------------------------------------------------------
 # Plugin lifecycle
 # ---------------------------------------------------------------------------
 
@@ -367,6 +472,55 @@ _REBUILD_TOO_SLOW = pytest.mark.skipif(
     reason="cold Ember CLI rebuild exceeds the free-runner CI budget; covered "
            "by other lifecycle tests once the cache is warm",
 )
+
+
+def test_lifecycle_materialization_on_plugin_change(lifecycle):
+    """First rebuild on the lifecycle fixture must materialize the symlinked
+    caches into real dirs. 'materializing' log appears exactly once over the
+    fixture's lifetime — this test must run before any other test that
+    triggers a rebuild on the lifecycle stack.
+
+    Add a small third-party plugin: it's the cheapest reliable rebuild
+    trigger that this fixture can take cold (vs. the Ember-CLI plugin-asset
+    rebuild that _REBUILD_TOO_SLOW guards against)."""
+    # Sanity check the precondition: fresh lifecycle stack has symlinked caches.
+    r = _exec(lifecycle.app, "test", "-L", "/data/cache/bundle")
+    assert r.returncode == 0, "preconditions broken: bundle not a symlink before first rebuild"
+
+    port = lifecycle.restart_app({
+        "CONTAINER_DISCOURSE_PLUGINS_BUILTIN": "",
+        "CONTAINER_DISCOURSE_PLUGINS": (
+            "https://github.com/discourse/discourse-prometheus@main"
+        ),
+    })
+    _wait_http_200(f"http://127.0.0.1:{port}/srv/status", READY_DEADLINE_S)
+    logs = _logs(lifecycle.app)
+    assert "materializing /data/cache/bundle" in logs, (
+        f"expected bundle materialization on plugin change:\n{logs[-3000:]}"
+    )
+    assert "Bundle complete!" in logs, "rebuild did not run"
+    # Bundle is now a real dir.
+    r = _exec(lifecycle.app, "test", "-L", "/data/cache/bundle")
+    assert r.returncode != 0, "bundle should no longer be a symlink after materialization"
+    r = _exec(lifecycle.app, "test", "-d", "/data/cache/bundle")
+    assert r.returncode == 0, "bundle should be a real directory after materialization"
+
+
+def test_lifecycle_gem_install_runs_before_migrate(lifecycle):
+    """Regression for the split-rebuild change. 'Bundle complete!' must appear
+    BEFORE 'running db:migrate' so plugins that load gems during Rails boot or
+    in migrations have them available. Replays against the rebuild-triggering
+    log captured by the previous test."""
+    logs = _logs(lifecycle.app)
+    # rfind so we get the most recent rebuild's ordering if multiple boots
+    # have logged these lines.
+    bundle_idx = logs.rfind("Bundle complete!")
+    migrate_idx = logs.find("running db:migrate", bundle_idx if bundle_idx >= 0 else 0)
+    assert bundle_idx >= 0, "no 'Bundle complete!' in logs — rebuild path didn't run"
+    assert migrate_idx > bundle_idx, (
+        f"expected 'Bundle complete!' (pos {bundle_idx}) before 'running db:migrate' "
+        f"(pos {migrate_idx}); split-rebuild ordering regressed"
+    )
 
 
 @_REBUILD_TOO_SLOW
@@ -475,6 +629,95 @@ def test_lifecycle_offline_uses_cached_plugin(lifecycle):
     assert "plugin manifest unchanged" in logs, (
         f"expected manifest-unchanged on cached restart; logs:\n{logs[-3000:]}"
     )
+
+
+def test_lifecycle_image_upgrade_custom_triggers_rebuild(lifecycle):
+    """Simulate an image upgrade against a custom-plugin (materialized
+    caches) state. /app changes survive docker restart but not docker rm,
+    so we mutate the fingerprint + manifest in place and use docker restart.
+
+    Materialization should NOT run again (caches were already real dirs)
+    but the rebuild branch must fire because the fingerprint changed."""
+    # Pre-stage: ensure prometheus is installed and the caches are materialized.
+    port = lifecycle.restart_app({
+        "CONTAINER_DISCOURSE_PLUGINS_BUILTIN": "",
+        "CONTAINER_DISCOURSE_PLUGINS": (
+            "https://github.com/discourse/discourse-prometheus@main"
+        ),
+    })
+    _wait_http_200(f"http://127.0.0.1:{port}/srv/status", READY_DEADLINE_S)
+    # Confirm precondition: caches are real dirs (already materialized by
+    # an earlier lifecycle test).
+    r = _exec(lifecycle.app, "test", "-L", "/data/cache/bundle")
+    assert r.returncode != 0, "precondition broken: bundle should not be a symlink here"
+
+    # Mutate the baked fingerprint + re-bake the manifest in lockstep.
+    r = _exec(lifecycle.app, "sh", "-c",
+              "echo upgrade-sim > /app/baked-image-fingerprint && "
+              "/usr/local/bin/discourse-manifest-hash "
+              "--builtin-file /app/baked-default-plugins "
+              "--third-party-file /dev/null "
+              "--image-fingerprint-file /app/baked-image-fingerprint "
+              "> /app/baked-plugin-manifest")
+    assert r.returncode == 0, r.stderr
+
+    pre = _logs(lifecycle.app)
+    _sh("docker", "restart", lifecycle.app)
+    port = _host_port(lifecycle.app, "3000")
+    _wait_http_200(f"http://127.0.0.1:{port}/srv/status", READY_DEADLINE_S)
+    tail = _logs(lifecycle.app)[len(pre):]
+    assert "plugin manifest changed" in tail, (
+        f"expected rebuild on fingerprint change with materialized caches:\n{tail[-3000:]}"
+    )
+    assert "Bundle complete!" in tail, "bundle install did not run"
+    assert "materializing" not in tail, "materialize_cache should be no-op on real dirs"
+
+
+def test_lifecycle_repaired_cache_forces_rebuild(lifecycle):
+    """Regression for the repair-loses-context bug. Wipe /data/cache/bundle
+    on a custom-plugin volume where the manifest still records the custom
+    hash; seed_or_link_cache restores the baked symlink and sets
+    caches_repaired=1; the manifest-decision must force a rebuild even
+    though current_hash still equals recorded_hash."""
+    # Pre-stage: install prometheus so we're in a custom-plugin state.
+    port = lifecycle.restart_app({
+        "CONTAINER_DISCOURSE_PLUGINS_BUILTIN": "",
+        "CONTAINER_DISCOURSE_PLUGINS": (
+            "https://github.com/discourse/discourse-prometheus@main"
+        ),
+    })
+    _wait_http_200(f"http://127.0.0.1:{port}/srv/status", READY_DEADLINE_S)
+    pre_manifest = _exec(lifecycle.app, "cat", "/data/cache/.plugin-manifest").stdout.strip()
+
+    # Nuke the bundle cache. The manifest file is left as-is (custom hash).
+    r = _exec(lifecycle.app, "rm", "-rf", "/data/cache/bundle")
+    assert r.returncode == 0, r.stderr
+
+    pre = _logs(lifecycle.app)
+    # Restart with the SAME env so manifest hash matches recorded_hash —
+    # without the caches_repaired guard, the unchanged branch would fire
+    # and the missing bundle would never be repopulated.
+    port = lifecycle.restart_app({
+        "CONTAINER_DISCOURSE_PLUGINS_BUILTIN": "",
+        "CONTAINER_DISCOURSE_PLUGINS": (
+            "https://github.com/discourse/discourse-prometheus@main"
+        ),
+    })
+    _wait_http_200(f"http://127.0.0.1:{port}/srv/status", READY_DEADLINE_S)
+    tail = _logs(lifecycle.app)[len(pre):]
+
+    assert "caches were repaired; forcing rebuild" in tail, (
+        f"expected forced rebuild log on repaired cache:\n{tail[-3000:]}"
+    )
+    assert "Bundle complete!" in tail, "rebuild path didn't run after cache repair"
+    # Manifest hash should round-trip back to the same custom value.
+    post_manifest = _exec(lifecycle.app, "cat", "/data/cache/.plugin-manifest").stdout.strip()
+    assert post_manifest == pre_manifest, (
+        f"manifest hash changed unexpectedly: {pre_manifest!r} -> {post_manifest!r}"
+    )
+    # And the bundle is back as a real directory.
+    r = _exec(lifecycle.app, "test", "-d", "/data/cache/bundle")
+    assert r.returncode == 0, "bundle dir not repopulated"
 
 
 # ---------------------------------------------------------------------------

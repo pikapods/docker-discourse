@@ -26,6 +26,89 @@ die() { log "ERROR: $*"; exit 1; }
 
 as_app() { gosu discourse:discourse "$@"; }
 
+# Flipped to 1 by seed_or_link_cache whenever it changes on-disk state
+# (creation, repair, or replacement of an existing manifest-volume's cache
+# state). The manifest-decision step below must not take the "unchanged"
+# branch when this is 1 — see the repair-loses-context failure mode.
+caches_repaired=0
+
+# Validators: cache-specific "is this dir a complete materialized cache?"
+bundle_dir_valid() { [ -d "$1/ruby" ]; }
+assets_dir_valid() {
+    # Modern Discourse writes /app/public/assets/.manifest.json (Propshaft)
+    # alongside manifest-<digest>.json (Sprockets). Presence of either =
+    # complete. Glob-only check via `set --`; a non-matching dotfile glob
+    # under default `set +f` stays literal, which $1 -e then rejects.
+    if [ -f "$1/.manifest.json" ]; then return 0; fi
+    set -- "$1"/manifest-*.json
+    [ -e "$1" ]
+}
+
+# Seed /data/cache subdir as a symlink to its baked source, unless it is
+# already a valid materialized real dir. Cleans up any leftover .new/ from
+# a prior interrupted materialization first.
+#
+# Distinguishes "fresh creation on a virgin volume" from "repair of a
+# wrong/missing state". Both leave the same end state (a baked symlink),
+# but the hash decision needs to treat them differently: fresh creation
+# is paired with the manifest-file seed further down, so the unchanged
+# branch fires legitimately. Repair invalidates whatever recorded hash
+# is already on disk, so the unchanged branch must be suppressed.
+# Presence of $MANIFEST_FILE at this point is the discriminator —
+# the manifest is seeded from baked only AFTER all seed_or_link_cache calls.
+seed_or_link_cache() {
+    target=$1; baked=$2; validator=$3
+    rm -rf "${target}.new"
+
+    if [ -L "$target" ]; then
+        resolved=$(readlink "$target")
+        if [ "$resolved" = "$baked" ]; then return 0; fi
+        log "WARN: $target -> $resolved; expected -> $baked; replacing"
+        rm "$target"
+    elif [ -d "$target" ]; then
+        if "$validator" "$target"; then return 0; fi
+        log "WARN: $target exists but failed $validator; replacing with link to $baked"
+        rm -rf "$target"
+    elif [ -e "$target" ]; then
+        log "WARN: $target is neither directory nor symlink; replacing"
+        rm -rf "$target"
+    fi
+
+    ln -s "$baked" "$target"
+    chown -h "$DISCOURSE_UID:$DISCOURSE_GID" "$target"
+    # Repair only — virgin volumes (no MANIFEST_FILE yet) take the
+    # unchanged branch via the manifest seed below.
+    if [ -f "$MANIFEST_FILE" ]; then
+        caches_repaired=1
+    fi
+}
+
+# Promote a symlinked /data/cache subdir to a writable real directory.
+# Refuses to materialize from any source other than the expected baked
+# path. Atomic swap via .new staging dir. Idempotent: no-op if already
+# a real dir.
+materialize_cache() {
+    target=$1; baked=$2
+    if [ -d "$target" ] && [ ! -L "$target" ]; then return 0; fi
+    if [ ! -L "$target" ]; then
+        die "$target is missing; cannot materialize"
+    fi
+    resolved=$(readlink "$target")
+    if [ "$resolved" != "$baked" ]; then
+        die "$target -> $resolved; refusing to materialize from anything other than $baked"
+    fi
+
+    tmp="${target}.new"
+    rm -rf "$tmp"
+    log "materializing $target from $baked"
+    mkdir "$tmp"
+    chown "$DISCOURSE_UID:$DISCOURSE_GID" "$tmp"
+    rsync -a "$baked/" "$tmp/"
+
+    rm "$target"
+    mv "$tmp" "$target"
+}
+
 # ---------------------------------------------------------------------------
 # 1. Preflight — /data writability. Same diagnostic style as freescout: an
 #    unchowned bind mount is the #1 first-run failure and a bare "permission
@@ -73,36 +156,28 @@ fi
 
 # ---------------------------------------------------------------------------
 # 3. Ensure /data subtree exists. Discourse-side dirs are created here so
-#    a fresh named volume doesn't need any host-side prep.
+#    a fresh named volume doesn't need any host-side prep. /data/cache/bundle
+#    and /data/cache/assets themselves are managed by seed_or_link_cache
+#    below (lazy symlink unless a previous boot materialized them).
 # ---------------------------------------------------------------------------
 for d in "$DATA_DIR/uploads" "$DATA_DIR/backups" "$DATA_DIR/plugins" \
-         "$DATA_DIR/cache/bundle" "$DATA_DIR/cache/assets"
+         "$DATA_DIR/cache"
 do
     mkdir -p "$d"
     chown "$DISCOURSE_UID:$DISCOURSE_GID" "$d"
 done
 
 # ---------------------------------------------------------------------------
-# 4. Seed runtime caches from the baked snapshots on first boot.
-#    BUNDLE_PATH points at /data/cache/bundle; without seeding, Rails has
-#    no gems and the boot fails before we can do anything useful.
+# 4. Seed runtime caches as symlinks pointing at the baked snapshots.
+#    BUNDLE_PATH points at /data/cache/bundle; without a working target,
+#    Rails has no gems and the boot fails before we can do anything useful.
+#    Bundler (deployment=true, frozen=true) and Pitchfork read through the
+#    symlinks; nothing writes. Materialization (real rsynced dir) is
+#    deferred to the rebuild branch, which is the only path that needs
+#    write access to the bundle / asset trees.
 # ---------------------------------------------------------------------------
-# Detect a populated bundle by the presence of a `ruby/<abi>/gems` subdir
-# rather than `[ -z "$(ls)" ]` — a stray dotfile shouldn't fool us.
-if [ ! -d "$DATA_DIR/cache/bundle/ruby" ]; then
-    log "seeding bundle cache from $BAKED_BUNDLE"
-    # rsync -a preserves the source's discourse:discourse ownership when
-    # run as root, so no follow-up chown is needed.
-    rsync -a "$BAKED_BUNDLE/" "$DATA_DIR/cache/bundle/"
-fi
-
-# Public/assets is a symlink to /data/cache/assets. Empty target = 404s on
-# every static request; seed from /app/assets-baked which holds the build-
-# time precompile output.
-if [ -z "$(ls -A "$DATA_DIR/cache/assets" 2>/dev/null)" ]; then
-    log "seeding asset cache from $BAKED_ASSETS"
-    rsync -a "$BAKED_ASSETS/" "$DATA_DIR/cache/assets/"
-fi
+seed_or_link_cache "$DATA_DIR/cache/bundle" "$BAKED_BUNDLE" bundle_dir_valid
+seed_or_link_cache "$DATA_DIR/cache/assets" "$BAKED_ASSETS" assets_dir_valid
 
 # Pre-seed the manifest hash with the baked (default-6) value. When the
 # operator's env matches the default surface, step 9's hash check will
@@ -322,7 +397,77 @@ rm -rf "$PLUGINS_LIVE_DIR"
 mv "$NEW_DIR" "$PLUGINS_LIVE_DIR"
 
 # ---------------------------------------------------------------------------
-# 8. Migrations.
+# 8. Compute manifest hash. Drives the split rebuild that straddles
+#    migrations: gems before, themes+assets after.
+# ---------------------------------------------------------------------------
+current_hash=$(/usr/local/bin/discourse-manifest-hash \
+    --builtin-file "$BUILTIN_LIST" \
+    --third-party-file "$ACTIVE_TP_FILE" \
+    --image-fingerprint-file /app/baked-image-fingerprint)
+baked_hash=$(cat "$BAKED_MANIFEST")
+recorded_hash=
+[ -f "$MANIFEST_FILE" ] && recorded_hash=$(cat "$MANIFEST_FILE")
+
+# Three-branch decision:
+#   1. unchanged AND no cache repair  → nothing to do
+#   2. matches baked default AND both → fast adopt: caches automatically
+#      caches are valid baked            follow the new image; just bump
+#      symlinks                          the recorded hash
+#   3. else                            → full rebuild (gems + migrate +
+#                                         themes/assets)
+#
+# Branch 1 must respect caches_repaired: if seed_or_link_cache had to
+# replace a wrong/invalid/missing cache state, the on-disk gems/assets
+# no longer match what recorded_hash claims, so "unchanged" would
+# wrongly skip a rebuild that's now necessary to repopulate.
+# Branch 2 already passes a stronger check (both are symlinks to baked
+# AND current_hash matches the baked default), so it does not need to
+# gate on caches_repaired.
+rebuild=no
+if [ "$current_hash" = "$recorded_hash" ] && [ "$caches_repaired" = "0" ]; then
+    log "plugin manifest unchanged (hash $current_hash); skipping rebuild"
+elif [ "$current_hash" = "$baked_hash" ] \
+        && [ -L "$DATA_DIR/cache/bundle" ] \
+        && [ -L "$DATA_DIR/cache/assets" ]; then
+    log "plugin set matches baked default and caches are symlinked; adopting hash $current_hash"
+    printf '%s\n' "$current_hash" > "$MANIFEST_FILE"
+    chown "$DISCOURSE_UID:$DISCOURSE_GID" "$MANIFEST_FILE"
+else
+    rebuild=yes
+    if [ "$caches_repaired" = "1" ] && [ "$current_hash" = "$recorded_hash" ]; then
+        log "caches were repaired; forcing rebuild despite unchanged manifest hash $current_hash"
+    else
+        log "plugin manifest changed ($recorded_hash -> $current_hash); rebuilding"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 9. Rebuild phase 1 (pre-migrate): materialize caches and install gems.
+#    Runs before db:migrate so a plugin that needs a new gem during Rails
+#    boot or in a migration has it available. Themes+assets are deferred
+#    to phase 2 because themes:update needs the DB.
+#
+#    deployment/frozen are unset just for `bundle install` (mirroring the
+#    upstream web.template.yml flow) and re-pinned IMMEDIATELY after, so
+#    db:migrate runs with the same pinned Bundler config it sees today.
+# ---------------------------------------------------------------------------
+if [ "$rebuild" = "yes" ]; then
+    materialize_cache "$DATA_DIR/cache/bundle" "$BAKED_BUNDLE"
+    materialize_cache "$DATA_DIR/cache/assets" "$BAKED_ASSETS"
+    ( cd "$APP_DIR" && as_app bash -c '
+        set -e
+        bundle config unset --local deployment >/dev/null
+        bundle config unset --local frozen >/dev/null
+        bundle install --jobs=4 --retry=3
+    ' ) >&2 || die "bundle install failed"
+    # Re-pin deployment NOW so migrations run with the same pinned
+    # Bundler config they see in today's pre-split flow.
+    as_app bundle config set --local deployment 'true' >/dev/null
+fi
+
+# ---------------------------------------------------------------------------
+# 10. Migrations. Gems from phase 1 are present; Bundler is back in
+#     deployment mode.
 # ---------------------------------------------------------------------------
 if [ "${CONTAINER_DISCOURSE_DB_MIGRATE:-TRUE}" = "TRUE" ]; then
     log "running db:migrate"
@@ -331,39 +476,23 @@ if [ "${CONTAINER_DISCOURSE_DB_MIGRATE:-TRUE}" = "TRUE" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 9. Conditional rebuild — only when the plugin manifest hash differs from
-#    the recorded one. Hash is written only after both bundle install and
-#    asset precompile succeed, so a half-built state does not poison the
-#    next boot.
+# 11. Rebuild phase 2 (post-migrate): themes (DB-dependent) + asset
+#     precompile. Both run with deployment pinned — neither task modifies
+#     the bundle, so the looser config used in today's combined block was
+#     incidental rather than required. Manifest hash is recorded only
+#     after both phases succeed; an interruption here leaves recorded_hash
+#     stale and the next boot retries the whole rebuild.
 # ---------------------------------------------------------------------------
-current_hash=$(/usr/local/bin/discourse-manifest-hash \
-    --builtin-file "$BUILTIN_LIST" \
-    --third-party-file "$ACTIVE_TP_FILE")
-recorded_hash=
-[ -f "$MANIFEST_FILE" ] && recorded_hash=$(cat "$MANIFEST_FILE")
-
-if [ "$current_hash" = "$recorded_hash" ]; then
-    log "plugin manifest unchanged (hash $current_hash); skipping rebuild"
-else
-    log "plugin manifest changed ($recorded_hash -> $current_hash); rebuilding"
-    # Plugin gems may need to be installed: drop deployment/frozen for
-    # this one invocation, matching upstream's web.template.yml flow.
-    ( cd "$APP_DIR" && as_app bash -c '
-        set -e
-        bundle config unset --local deployment >/dev/null
-        bundle config unset --local frozen >/dev/null
-        bundle install --jobs=4 --retry=3
-        bundle exec rake themes:update assets:precompile
-    ' ) >&2 || die "plugin rebuild failed (bundle install + themes:update + assets:precompile)"
-    # Re-pin deployment now that the new gems are present.
-    as_app bundle config set --local deployment 'true' >/dev/null
+if [ "$rebuild" = "yes" ]; then
+    ( cd "$APP_DIR" && as_app bundle exec rake themes:update assets:precompile ) >&2 \
+        || die "themes:update + assets:precompile failed"
     printf '%s\n' "$current_hash" > "$MANIFEST_FILE"
     chown "$DISCOURSE_UID:$DISCOURSE_GID" "$MANIFEST_FILE"
     log "rebuild complete; manifest hash recorded"
 fi
 
 # ---------------------------------------------------------------------------
-# 10. Admin seed — idempotent. Skipped silently when no email set.
+# 12. Admin seed — idempotent. Skipped silently when no email set.
 # ---------------------------------------------------------------------------
 if [ -n "${CONTAINER_DISCOURSE_ADMIN_EMAIL:-}" ]; then
     log "seeding admin user (idempotent)"
