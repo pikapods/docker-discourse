@@ -2,6 +2,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import subprocess
 import time
 import urllib.error
@@ -39,6 +40,16 @@ def _exec(container, *args, check=False):
         ["docker", "exec", container, *args],
         capture_output=True, text=True, check=check,
     )
+
+
+def _psql(stack, sql):
+    # tuples-only (-t), unaligned (-A), pipe-separated (-F|) — easy to split.
+    r = _exec(
+        stack["pg"], "psql", "-U", "discourse", "-d", "discourse",
+        "-tA", "-F", "|", "-c", sql,
+        check=True,
+    )
+    return r.stdout.strip()
 
 
 def _logs(container):
@@ -94,6 +105,20 @@ def _gen_secret():
     return secrets.token_hex(64)
 
 
+def _pick_free_port():
+    # Real Docker accepts `-p 0:3000` as "let the OS pick the host port", but
+    # podman (5.x) rejects port 0 at parse time. Pre-allocate via SO_REUSEADDR
+    # so the same arg works on both — a tiny race between close() and docker's
+    # bind, but acceptable for a single-test-process suite.
+    s = socket.socket()
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
 class Stack:
     """Helper to spin a pg+redis pair with consistent naming. Tests that
     only need defaults use the `stack` session fixture below."""
@@ -146,11 +171,13 @@ class Stack:
             "-v", f"{self.vol}:/data",
             *env_args,
         ]
+        host_port = None
         if port:
-            args += ["-p", "0:3000"]
+            host_port = _pick_free_port()
+            args += ["-p", f"{host_port}:3000"]
         args += [IMAGE]
         _sh(*args)
-        return _host_port(self.app, "3000") if port else None
+        return host_port
 
     def restart_app(self, extra_env=None):
         _sh("docker", "rm", "-f", self.app)
@@ -471,3 +498,124 @@ def test_second_boot_no_new_migrations(stack):
     assert "migrating ====" not in tail and ": migrating" not in tail, (
         f"second boot ran migrations; logs:\n{tail[-2000:]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Admin seeder (rootfs/app/script/seed_admin.rb)
+#
+# Regression tests for the two bugs fixed in ffd962a:
+#   1. The "skip if admin exists" check matched Discourse's built-in system
+#      users (id=-1, id=-2), so the seeder short-circuited on every fresh DB.
+#      The `id > 0` filter is what scopes the check to real users.
+#   2. user.activate ran before user.save!, raising RecordNotSaved because
+#      activate's email_tokens.create! needs a persisted parent.
+#
+# Happy-path / idempotency tests ride the session `stack` fixture (already
+# boots with CONTAINER_DISCOURSE_ADMIN_EMAIL + _PASSWORD set), so they cost
+# no extra container boots. The no-email path needs a dedicated Stack.
+# ---------------------------------------------------------------------------
+
+# Email lives in user_emails (one-to-many on users) since the 2017 migration
+# that created user_emails and marked users.email readonly; the column was
+# later dropped outright in v2026. Look the admin up via the primary email.
+ADMIN_EMAIL = "admin@smoke.local"
+_BY_EMAIL_JOIN = (
+    "JOIN user_emails ue ON ue.user_id = u.id AND ue.\"primary\" = true "
+    f"WHERE ue.email='{ADMIN_EMAIL}'"
+)
+
+
+def test_admin_seeded_in_db(stack):
+    """Real admin user exists with admin=t, approved=t, active=t and id > 0.
+    A regression of the `id > 0` filter would cause the seeder to short-
+    circuit on the system users and this row would not exist."""
+    rows = _psql(
+        stack,
+        f"SELECT u.id, u.admin, u.approved, u.active FROM users u {_BY_EMAIL_JOIN}",
+    ).splitlines()
+    assert len(rows) == 1, f"expected exactly one admin row, got: {rows!r}"
+    id_str, admin, approved, active = rows[0].split("|")
+    assert int(id_str) > 0, f"admin user id should be > 0, got {id_str!r}"
+    assert (admin, approved, active) == ("t", "t", "t"), \
+        f"unexpected admin row flags: admin={admin!r} approved={approved!r} active={active!r}"
+
+
+def test_admin_email_token_confirmed(stack):
+    """A confirmed EmailToken exists for the seeded admin. This pins the
+    save-before-activate ordering — if activate ran on an unsaved parent
+    the user row itself would not exist (caught by the previous test);
+    if a regression dropped activate entirely, no confirmed token would
+    be present and the operator would be stuck at email verification."""
+    # email_tokens.email is still a column (the v2026 schema only dropped
+    # users.email), so this is a single-table lookup.
+    rows = _psql(
+        stack,
+        f"SELECT confirmed FROM email_tokens "
+        f"WHERE email='{ADMIN_EMAIL}' AND confirmed = true",
+    ).splitlines()
+    assert rows, "expected at least one confirmed EmailToken for the seeded admin"
+    assert all(r == "t" for r in rows), f"unexpected confirmed values: {rows!r}"
+
+
+def test_admin_seed_idempotent_on_restart(stack):
+    """Restarting the container with the same admin env must not duplicate
+    or mutate the admin user — the `User.where(admin: true).where('id > 0')`
+    short-circuit is the load-bearing check.
+
+    Password material lives in `user_passwords` since Discourse migration
+    20241011080517 dropped `password_hash`/`salt` from `users`; joining
+    that table catches a regression that re-runs the create path and
+    rotates the hash."""
+    snapshot_sql = (
+        "SELECT u.id, u.created_at, up.password_hash, up.password_salt "
+        "FROM users u "
+        "LEFT JOIN user_passwords up ON up.user_id = u.id "
+        f"{_BY_EMAIL_JOIN}"
+    )
+    before = _psql(stack, snapshot_sql).splitlines()
+    assert len(before) == 1, f"expected exactly one admin row before restart: {before!r}"
+
+    _sh("docker", "restart", stack["app"])
+    port = _host_port(stack["app"], "3000")
+    _wait_http_200(f"http://127.0.0.1:{port}/srv/status", FAST_READY_DEADLINE_S)
+
+    after = _psql(stack, snapshot_sql).splitlines()
+    assert after == before, (
+        f"admin row mutated across restart\n  before: {before!r}\n  after:  {after!r}"
+    )
+
+
+@pytest.fixture(scope="module")
+def no_admin_stack():
+    """Fresh Stack with CONTAINER_DISCOURSE_ADMIN_EMAIL overridden to empty.
+    docker's last-wins env resolution kills the Stack default; s6-envdir
+    then drops the 0-byte var to unset (same mechanic exploited by
+    test_lifecycle_empty_disables_all). The entrypoint's `-n` check at
+    20-discourse-bootstrap.sh:368 then skips the seeder entirely."""
+    s = Stack("no-admin")
+    try:
+        s.up_services()
+        port = s.up_app(extra_env={"CONTAINER_DISCOURSE_ADMIN_EMAIL": ""})
+        try:
+            _wait_http_200(f"http://127.0.0.1:{port}/srv/status", READY_DEADLINE_S)
+        except RuntimeError:
+            print(_logs(s.app))
+            raise
+        yield {"app": s.app, "pg": s.pg, "redis": s.redis, "port": port, "stack": s}
+    finally:
+        s.teardown()
+
+
+def test_admin_seed_skips_when_email_unset(no_admin_stack):
+    """No CONTAINER_DISCOURSE_ADMIN_EMAIL → boot succeeds and no real admin
+    is created. Operators who want to do first admin via the web onboarding
+    flow must not be surprised by a seeded user from a stray default."""
+    count = _psql(
+        no_admin_stack,
+        "SELECT count(*) FROM users WHERE admin = true AND id > 0",
+    )
+    assert count == "0", f"expected zero real admin users, got {count!r}"
+
+    logs = _logs(no_admin_stack["app"])
+    assert "seeding admin user" not in logs, \
+        "entrypoint logged 'seeding admin user' despite empty CONTAINER_DISCOURSE_ADMIN_EMAIL"
