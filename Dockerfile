@@ -57,6 +57,18 @@ RUN if echo "${DISCOURSE_VERSION}" | grep -Eq '^[0-9a-f]{40}$'; then \
         git clone --depth=1 --branch="${DISCOURSE_VERSION}" "${DISCOURSE_REPO}" /app; \
     fi
 
+# Upstream PR #39788 (first shipped in v2026.5.0) bakes db/structure.sql with a
+# bare `CREATE SCHEMA discourse_functions;`. On a fresh DB, Rails 8's
+# DatabaseTasks#migrate calls load_schema → structure_load (psql -f) when
+# schema_migrations is missing. If anything else (plugin initializer, etc.)
+# creates the schema first via Migration::BaseDropper.create_readonly_function
+# (which uses IF NOT EXISTS), structure_load explodes on the duplicate. Make
+# the upstream line match the IF NOT EXISTS variant the rest of the codebase
+# uses. Guarded with test -f so older tags without structure.sql are a no-op.
+RUN if [ -f /app/db/structure.sql ]; then \
+        sed -i 's/^CREATE SCHEMA discourse_functions;$/CREATE SCHEMA IF NOT EXISTS discourse_functions;/' /app/db/structure.sql; \
+    fi
+
 # Pin gem install path BEFORE deployment=true. Bundler's deployment mode
 # otherwise defaults to vendor/bundle (project-relative), which breaks our
 # runtime COPY --from=builder /usr/local/bundle.

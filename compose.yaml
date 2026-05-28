@@ -2,7 +2,12 @@ name: discourse
 
 services:
   postgres:
-    image: postgres:16
+    # pgvector/pgvector:pg16 is postgres:16 with the pgvector extension
+    # preinstalled. Upstream Discourse v2026.5.0+ bakes db/structure.sql with
+    # `CREATE EXTENSION vector` and `halfvec` columns for the in-tree AI
+    # plugin's embeddings tables, so a vanilla postgres:16 image fails
+    # structure_load on a fresh DB.
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_DB: discourse
       POSTGRES_USER: discourse

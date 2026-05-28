@@ -140,7 +140,7 @@ class Stack:
             "-e", "POSTGRES_PASSWORD=test",
             "-e", "POSTGRES_DB=discourse",
             "-e", "POSTGRES_USER=discourse",
-            "postgres:16",
+            "pgvector/pgvector:pg16",
         )
         _wait_pg_ready(self.pg)
         _sh(
@@ -222,7 +222,7 @@ def test_secret_key_required_fail_fast():
         _sh("docker", "network", "create", net)
         _sh("docker", "run", "-d", "--name", pg, "--network", net,
             "-e", "POSTGRES_PASSWORD=test", "-e", "POSTGRES_DB=discourse",
-            "-e", "POSTGRES_USER=discourse", "postgres:16")
+            "-e", "POSTGRES_USER=discourse", "pgvector/pgvector:pg16")
         _wait_pg_ready(pg)
         _sh("docker", "run", "-d", "--name", redis, "--network", net, "redis:7-alpine")
         _wait_redis_ready(redis)
