@@ -69,6 +69,20 @@ RUN if [ -f /app/db/structure.sql ]; then \
         sed -i 's/^CREATE SCHEMA discourse_functions;$/CREATE SCHEMA IF NOT EXISTS discourse_functions;/' /app/db/structure.sql; \
     fi
 
+# Upstream v2026.6.0 (#40447) swapped the asset-processor bundler from esbuild to
+# rolldown, which defaults to tsconfig auto-discovery (tsconfig: true). Building
+# frontend/asset-processor/transpiler.js walks up to the solution-style root
+# /app/tsconfig.json and loads every `references` entry to decide file ownership.
+# This image stashes all non-default plugins out of /app/plugins, so ~39 of the
+# 45 referenced plugins/<name>/tsconfig.json files are gone and oxc-resolver
+# aborts every import with "Tsconfig not found" — breaking both the build-time
+# assets:precompile and the runtime rebuild (bootstrap re-runs assets:precompile
+# when /data plugins change). The root tsconfig is TypeScript dev tooling with no
+# role at precompile or runtime here, and is the only config referencing the
+# stashed plugins; removing it makes the stash self-consistent. (rm -f no-ops on
+# older tags / if upstream relocates it.)
+RUN rm -f /app/tsconfig.json
+
 # Pin gem install path BEFORE deployment=true. Bundler's deployment mode
 # otherwise defaults to vendor/bundle (project-relative), which breaks our
 # runtime COPY --from=builder /usr/local/bundle.
